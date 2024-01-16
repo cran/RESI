@@ -209,7 +209,7 @@ resi.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
                   ncpus = ncpus, mod.full = model.full, mod.reduced = model.reduced,
                   anova = anova, coefficients = coefficients, overall = overall, vcovfunc = vcovfunc,
                   Anova.args = Anova.args, vcov.args = vcov.args, unbiased = unbiased,
-                  boot.method = boot.method, clvar = clvar, ...), file = nullfile()))
+                  boot.method = boot.method, clvar = clvar, nest = length(output$estimates), ...), file = nullfile()))
 
   # bootstrapped estimates
   boot.results = boot_out$t
@@ -347,19 +347,21 @@ resi.lm = function(model.full, model.reduced = NULL, data, anova = TRUE,
                     parallel = c("no", "multicore", "snow"),
                     ncpus = getOption("boot.ncpus", 1L), ...){
   boot.method = match.arg(tolower(boot.method), choices = c("nonparam", "bayes"))
+
   resi.default(model.full = model.full, model.reduced = model.reduced, data = data,
                anova = anova, coefficients = coefficients, overall = overall,
                nboot = nboot, vcovfunc = vcovfunc, store.boot = store.boot,
                Anova.args = Anova.args, vcov.args = vcov.args, unbiased = unbiased,
                alpha = alpha, parallel = parallel, ncpus = ncpus,
                boot.method = boot.method, ...)
+
 }
 
 #' @describeIn resi RESI point and interval estimation for nls models
 #' @export
 resi.nls = function(model.full, model.reduced = NULL, data, coefficients = TRUE,
                      overall = TRUE, nboot = 1000, boot.method = "nonparam",
-                     anova = FALSE, vcovfunc = regtools::nlshc, alpha = 0.05,
+                     anova = FALSE, vcovfunc = r_nlshc, alpha = 0.05,
                      store.boot = FALSE, vcov.args = list(), unbiased = TRUE,
                      parallel = c("no", "multicore", "snow"), ncpus = getOption("boot.ncpus", 1L),
                      ...){
@@ -370,7 +372,7 @@ resi.nls = function(model.full, model.reduced = NULL, data, coefficients = TRUE,
     stop("\nData argument is required for nls model")
   }
   if (identical(vcovfunc, sandwich::vcovHC)){
-    vcovfunc = regtools::nlshc
+    vcovfunc = r_nlshc
     warning("Sandwich vcov function not applicable for nls model type, vcovfunc set to regtools::nlshc")
   }
 
@@ -380,6 +382,7 @@ resi.nls = function(model.full, model.reduced = NULL, data, coefficients = TRUE,
                         store.boot = TRUE, unbiased = unbiased, alpha = alpha,
                         vcov.args = vcov.args, parallel = parallel,
                         ncpus = ncpus, boot.method = boot.method, skip.red = TRUE, ...)
+
 
   # number of bootstrap replicates with failed updating
   output$nfail = length(which(is.na(output$boot.results$t[,1])))
@@ -466,11 +469,13 @@ resi.hurdle = function(model.full, model.reduced = NULL, data, coefficients = TR
   if ("boot.method" %in% names(dots)){
     stop("\nOnly nonparametric bootstrap supported for model type")
   }
+
   resi.default(model.full = model.full, model.reduced = model.reduced, data = data,
                coefficients = coefficients, overall = overall, nboot = nboot,
                anova = FALSE, vcovfunc = vcovfunc, store.boot = store.boot,
                vcov.args = vcov.args, unbiased = unbiased, alpha = alpha,
                boot.method = "nonparam", parallel = parallel, ncpus = ncpus, ...)
+
 }
 
 #' @describeIn resi RESI point and interval estimation for zeroinfl models
@@ -510,9 +515,9 @@ resi.geeglm = function(model.full, model.reduced = NULL, data, anova = TRUE,
                         parallel = parallel, ncpus = ncpus, boot.method = "nonparam",
                         cluster = TRUE, clvar = id_var, mod.dat = data, long = TRUE, ...)
 
-
   # number of bootstrap replicates with failed updating
   output$nfail = length(which(is.na(output$boot.results$t[,1])))
+
 
   if (!store.boot){
     output = output[names(output) != "boot.results"]
@@ -551,7 +556,6 @@ resi.gee = function(model.full, data, nboot = 1000, alpha = 0.05,
                         ncpus = ncpus, boot.method = "nonparam", cluster = TRUE,
                         clvar = id_var, mod.dat = data, skip.red = TRUE, long = TRUE,
                         overall = FALSE, ...)
-
 
   # number of bootstrap replicates with failed updating
   output$nfail = length(which(is.na(output$boot.results$t[,1])))
