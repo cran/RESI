@@ -1,4 +1,13 @@
-## RESI 1.2.5
+## RESI 1.3.2
+
+* Added RESI estimation for `emmeans` objects
+* Added support for `glmgee` models from `glmtoolbox`
+* Added support for Gaussian models from `glmmTMB`
+* Added pdf vignette (`vignette("RESI_paper")`)
+* Fixed bug with `geeglm` objects not assigning weights properly with missing data
+* Documentation fix for Linux systems
+
+## RESI 1.3.0
 
 * Added citation for Journal of Statistical Software paper <doi:10.18637/jss.v112.i03>
 * Bug fix in cluster bootstrapping: Now correctly assigns the clustered IDs in the bootstrap
