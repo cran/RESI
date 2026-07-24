@@ -5,6 +5,8 @@
 \alias{resi.default}
 \alias{resi.glm}
 \alias{resi.lm}
+\alias{resi.lmrob}
+\alias{resi.glmrob}
 \alias{resi.nls}
 \alias{resi.survreg}
 \alias{resi.coxph}
@@ -39,6 +41,7 @@ resi(model.full, ...)
   ncpus = getOption("boot.ncpus", 1L),
   long = FALSE,
   clvar = NULL,
+  ci.method = c("boot", "qf", "cf", "normal"),
   ...
 )
 
@@ -58,6 +61,7 @@ resi(model.full, ...)
   unbiased = TRUE,
   parallel = c("no", "multicore", "snow"),
   ncpus = getOption("boot.ncpus", 1L),
+  ci.method = "qf",
   ...
 )
 
@@ -78,6 +82,48 @@ resi(model.full, ...)
   unbiased = TRUE,
   parallel = c("no", "multicore", "snow"),
   ncpus = getOption("boot.ncpus", 1L),
+  ci.method = "qf",
+  ...
+)
+
+\method{resi}{lmrob}(
+  model.full,
+  model.reduced = NULL,
+  data,
+  anova = TRUE,
+  coefficients = TRUE,
+  overall = TRUE,
+  nboot = 1000,
+  boot.method = "nonparam",
+  vcovfunc = stats::vcov,
+  alpha = 0.05,
+  store.boot = FALSE,
+  Anova.args = list(),
+  vcov.args = list(),
+  unbiased = TRUE,
+  parallel = c("no", "multicore", "snow"),
+  ncpus = getOption("boot.ncpus", 1L),
+  ci.method = "boot",
+  ...
+)
+
+\method{resi}{glmrob}(
+  model.full,
+  model.reduced = NULL,
+  data,
+  anova = TRUE,
+  coefficients = TRUE,
+  overall = TRUE,
+  nboot = 1000,
+  vcovfunc = stats::vcov,
+  alpha = 0.05,
+  store.boot = FALSE,
+  Anova.args = list(),
+  vcov.args = list(),
+  unbiased = TRUE,
+  parallel = c("no", "multicore", "snow"),
+  ncpus = getOption("boot.ncpus", 1L),
+  ci.method = "boot",
   ...
 )
 
@@ -261,7 +307,8 @@ resi(model.full, ...)
 
 \item{overall}{Logical, whether to produce an overall Wald test comparing full to reduced model with RESI columns added. By default = `TRUE`.}
 
-\item{nboot}{Numeric, the number of bootstrap replicates. By default, 1000.}
+\item{nboot}{Numeric, the number of bootstrap replicates. Used only when
+`ci.method = "boot"`. By default, 1000.}
 
 \item{boot.method}{String, which type of bootstrap to use: `nonparam` = non-parametric bootstrap (default); `bayes` = Bayesian bootstrap.}
 
@@ -284,6 +331,11 @@ resi(model.full, ...)
 \item{long}{Logical, whether the data is longitudinal/clustered. By default, `FALSE`.}
 
 \item{clvar}{Character, the name of the cluster/id variable if data is clustered. By default, `NULL`.}
+
+\item{ci.method}{Character, the method used to compute confidence intervals.
+One of `"boot"` (bootstrap), `"qf"` (quadratic-form inversion, default for lm and glm),
+`"normal"` (normal approximation), or `"cf"` (Cornish-Fisher inversion).
+See `resi_pe_asymptotic` for details on the asymptotic methods.}
 }
 \value{
 Returns a list that includes function arguments, RESI point estimates,
@@ -341,6 +393,10 @@ and then try rerunning \code{resi}.
 \item \code{resi(glm)}: RESI point and interval estimation for models
 
 \item \code{resi(lm)}: RESI point and interval estimation for lm models
+
+\item \code{resi(lmrob)}: RESI point and interval estimation for lmrob models (robustbase)
+
+\item \code{resi(glmrob)}: RESI point and interval estimation for glmrob models (robustbase)
 
 \item \code{resi(nls)}: RESI point and interval estimation for nls models
 

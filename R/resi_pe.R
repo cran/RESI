@@ -1,4 +1,5 @@
 utils::globalVariables("w")
+utils::globalVariables("w_cs")
 
 
 #' Robust Effect Size Index (RESI) Point Estimation
@@ -106,7 +107,11 @@ resi_pe.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
   if (is.null(model.reduced) & overall){
     if(!("skip.red.pe" %in% names(dots))){
       form.reduced = as.formula(paste(format(formula(model.full)[[2]]), "~ 1"))
-      if ((form.reduced == formula(model.full))){
+      if(!all(all.vars(form.reduced) %in% names(data)) ){
+        form.reduced = as.formula( paste0('`', format(formula(model.full)[[2]]), '`', "~1"))
+        if (length(attr(terms(formula(model.full)), "term.labels")) == 0) overall = FALSE
+      }
+      if (overall & (form.reduced == formula(model.full))){
         overall = FALSE} else{
           if (is.null(model.full$na.action)){
             model.reduced <- try(update(model.full, formula = form.reduced,
@@ -127,6 +132,18 @@ resi_pe.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
           }}}
 
   # dealing with additional vcov args
+  # Guard: if vcovfunc is sandwich::vcovHC and vcov.args contains type = "const",
+  # the user likely intends the parametric (model-based) variance. "const" is not
+  # a valid HC type and will either error or silently give incorrect results.
+  # Users should pass vcovfunc = stats::vcov for parametric variance instead.
+  if (identical(vcovfunc, sandwich::vcovHC) && isTRUE(vcov.args[["type"]] == "const")) {
+    stop(paste0(
+      "\nvcov.args = list(type = \"const\") is not valid for sandwich::vcovHC.\n",
+      "For parametric (model-based) variance, use vcovfunc = stats::vcov instead.\n",
+      "For a heteroskedasticity-consistent estimator, use type = \"HC3\" (default),\n",
+      "  \"HC0\", \"HC1\", \"HC2\", \"HC4\", etc."
+    ))
+  }
   if (length(vcov.args) == 0){
     vcovfunc2 <- vcovfunc
   } else{
@@ -241,9 +258,13 @@ resi_pe.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
       anova.tab = anova.tab[which(rownames(anova.tab) != "Residuals"),]
       anova.tab[,"RESI"] = f2S(anova.tab[,"F"], anova.tab[,"Df"], res.df, nrow(data))
     } else {
+      # For most model types, pass test.statistic = "Wald" explicitly.
+      # For model types where car::Anova uses chi-square by default and does not
+      # accept test.statistic = "Wald" (e.g. lmrob), the caller can pass
+      # anovaChisq = TRUE via dots to skip that override.
+      test_stat_arg <- if ("anovaChisq" %in% names(dots)) list() else list(test.statistic = "Wald")
       tryCatch(suppressMessages(anova.tab <- do.call(car::Anova, c(list(mod = model.full,
-                                             test.statistic = "Wald",
-                                             vcov. = vcovmat), Anova.args))),
+                                             vcov. = vcovmat), test_stat_arg, Anova.args))),
                error = function(e){
           stop("car::Anova failed. Try rerunning with anova = FALSE")})
       anova.tab = anova.tab[which(rownames(anova.tab) != "Residuals"),]
@@ -410,6 +431,59 @@ resi_pe.hurdle = function(model.full, model.reduced = NULL, data, coefficients =
 #' @describeIn resi_pe RESI point estimation for zeroinfl models
 #' @export
 resi_pe.zeroinfl = resi_pe.hurdle
+
+#' @describeIn resi_pe RESI point estimation for lmrob objects (robustbase package)
+#' @export
+resi_pe.lmrob <- function(model.full, model.reduced = NULL, data, anova = TRUE,
+                          coefficients = TRUE, vcovfunc = stats::vcov,
+                          Anova.args = list(), vcov.args = list(),
+                          unbiased = TRUE, overall = TRUE, ...) {
+  # lmrob (robustbase) has a built-in robust sandwich variance estimator
+  # returned by stats::vcov(), so that is the natural default. sandwich::vcovHC
+  # also works but is redundant. car::Anova() for lmrob returns chi-square
+  # statistics, so we use waldtype = 0 (chi-square Wald test).
+  output <- resi_pe.default(
+    model.full   = model.full,
+    model.reduced = model.reduced,
+    data         = data,
+    anova        = anova,
+    coefficients = coefficients,
+    vcovfunc     = vcovfunc,
+    Anova.args   = Anova.args,
+    vcov.args    = vcov.args,
+    unbiased     = unbiased,
+    overall      = overall,
+    waldtype     = 0, anovaChisq = TRUE, ...)
+  return(output)
+}
+
+#' @describeIn resi_pe RESI point estimation for glmrob objects (robustbase package)
+#' @export
+resi_pe.glmrob <- function(model.full, model.reduced = NULL, data, anova = TRUE,
+                           coefficients = TRUE, vcovfunc = stats::vcov,
+                           Anova.args = list(), vcov.args = list(),
+                           unbiased = TRUE, overall = TRUE, ...) {
+  # glmrob (robustbase) has a built-in robust sandwich variance estimator.
+  # sandwich::vcovHC does not support glmrob; redirect to stats::vcov.
+  if (identical(vcovfunc, sandwich::vcovHC)) {
+    vcovfunc <- stats::vcov
+    warning("sandwich::vcovHC is not supported for glmrob objects. ",
+            "Using the model's built-in robust variance (stats::vcov) instead.")
+  }
+  output <- resi_pe.default(
+    model.full   = model.full,
+    model.reduced = model.reduced,
+    data         = data,
+    anova        = anova,
+    coefficients = coefficients,
+    vcovfunc     = vcovfunc,
+    Anova.args   = Anova.args,
+    vcov.args    = vcov.args,
+    unbiased     = unbiased,
+    overall      = overall,
+    waldtype     = 0, ...)
+  return(output)
+}
 
 #' @describeIn resi_pe RESI point estimation for geeglm object
 #' @export
@@ -758,15 +832,31 @@ resi_pe.lme <- function(model.full, anova = TRUE, vcovfunc = clubSandwich::vcovC
 #' @describeIn resi_pe RESI point estimation for lmerMod object
 #' @export
 resi_pe.lmerMod <- function(model.full, anova = TRUE, vcovfunc = clubSandwich::vcovCR,
-                            Anova.args = list(), vcov.args = list(), ...){
+                            Anova.args = list(), vcov.args = list(), unbiased = TRUE, ...){
   x = as.matrix(summary(model.full)$coefficients)
-  #sample size
-  N = summary(model.full)$ngrps
+  # sample size (number of clusters from primary grouping factor)
+  N = summary(model.full)$ngrps[[1]]
 
-  # robust se
+  # CS-RESI: extract primary cluster variable and compute per-observation weights
+  id_var <- names(lme4::ranef(model.full))[[1]]
+  data_mf <- as.data.frame(model.frame(model.full))
+  n_i <- table(data_mf[[id_var]])
+  data_mf$w_cs <- 1 / as.numeric(n_i[match(as.character(data_mf[[id_var]]), names(n_i))])
+  # weighted independence lm (fixed effects only, random effects stripped)
+  fix_form <- lme4::nobars(formula(model.full))
+  mod_ind_lm <- lm(fix_form, data = data_mf, weights = w_cs)
+  # rescale residuals to undo the weight transformation (mirrors geeglm CS approach)
+  mod_ind_lm$residuals <- mod_ind_lm$residuals / sqrt(mod_ind_lm$weights)
+  # HC0 sandwich variance for CS model
+  cov_ind <- sandwich::vcovHC(mod_ind_lm, type = "HC0")
+  cs_coef_tab <- lmtest::coeftest(mod_ind_lm, vcov. = cov_ind)
+
+  # robust se (L-RESI)
   if (identical(vcovfunc, stats::vcov)) {
-    coefficients.tab = cbind(x, 'Wald' = x[, 't value']^2, RESI = RESI::chisq2S(x[, 't value']^2, 1, N))
-    output = list(estimates = coefficients.tab[,"RESI"], coefficients = coefficients.tab, naive.var = TRUE)
+    coefficients.tab = cbind(x, 'Wald' = x[, 't value']^2,
+                             'L-RESI' = RESI::chisq2S(x[, 't value']^2, 1, N),
+                             'CS-RESI' = z2S(cs_coef_tab[, 't value'], N, unbiased))
+    output = list(estimates = coefficients.tab[,"L-RESI"], coefficients = coefficients.tab, naive.var = TRUE)
     vcovfunc2 = vcovfunc
   } else {
     if (length(vcov.args) == 0){
@@ -785,9 +875,9 @@ resi_pe.lmerMod <- function(model.full, anova = TRUE, vcovfunc = clubSandwich::v
     robust_se = sqrt(robust_var)
     coefficients.tab = cbind(x, 'Robust.SE' = robust_se,
                              'Robust Wald' = (x[, 'Estimate']^2/robust_var),
-                             RESI = RESI::chisq2S(x[, 'Estimate']^2/robust_var, 1, N))
-    # model full is not the same process as others, so print method is missing the call
-    output = list(estimates = coefficients.tab[,"RESI"], coefficients = coefficients.tab,
+                             'L-RESI' = RESI::chisq2S(x[, 'Estimate']^2/robust_var, 1, N),
+                             'CS-RESI' = z2S(cs_coef_tab[, 't value'], N, unbiased))
+    output = list(estimates = coefficients.tab[,"L-RESI"], coefficients = coefficients.tab,
                   naive.var = FALSE)
   }
   names(output$estimates) = rownames(coefficients.tab)
@@ -795,10 +885,14 @@ resi_pe.lmerMod <- function(model.full, anova = TRUE, vcovfunc = clubSandwich::v
   if (anova){
     suppressMessages(anova.tab <- do.call(car::Anova,
                                           c(list(mod = model.full, vcov. = vcovfunc2), Anova.args)))
-    anova.tab[,'RESI'] = chisq2S(anova.tab[,'Chisq'], anova.tab[,'Df'], N)
+    anova.tab[,'L-RESI'] = chisq2S(anova.tab[,'Chisq'], anova.tab[,'Df'], N)
+    # CS-RESI anova table: car::Anova on lm returns F-stats; F * Df = Wald Chisq
+    anova.tabcs <- suppressMessages(car::Anova(mod_ind_lm, vcov. = cov_ind))
+    anova.tabcs <- anova.tabcs[!is.na(anova.tabcs[, "F"]), , drop = FALSE]
+    anova.tab[,'CS-RESI'] = chisq2S(anova.tabcs[,'F'] * anova.tabcs[,'Df'], anova.tabcs[,'Df'], N)
     names.est = names(output$estimates)
-    output$estimates = c(output$estimates, anova.tab$RESI)
-    names.est = c(names.est, rownames(anova.tab))
+    output$estimates = c(output$estimates, anova.tab$`L-RESI`, anova.tab$`CS-RESI`)
+    names.est = c(names.est, rownames(anova.tab), rownames(anova.tab))
     names(output$estimates) = names.est
     output$anova = anova.tab
     class(output$anova) = c("anova_resi", class(output$anova))

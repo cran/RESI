@@ -8,7 +8,12 @@
 #' @param coefficients Logical, whether to produce a coefficients (summary) table with the RESI columns added. By default = `TRUE`.
 #' @param anova Logical, whether to produce an Anova table with the RESI columns added. By default = `TRUE`.
 #' @param overall Logical, whether to produce an overall Wald test comparing full to reduced model with RESI columns added. By default = `TRUE`.
-#' @param nboot Numeric, the number of bootstrap replicates. By default, 1000.
+#' @param ci.method Character, the method used to compute confidence intervals.
+#'   One of `"boot"` (bootstrap), `"qf"` (quadratic-form inversion, default for lm and glm),
+#'   `"normal"` (normal approximation), or `"cf"` (Cornish-Fisher inversion).
+#'   See `resi_pe_asymptotic` for details on the asymptotic methods.
+#' @param nboot Numeric, the number of bootstrap replicates. Used only when
+#'   `ci.method = "boot"`. By default, 1000.
 #' @param boot.method String, which type of bootstrap to use: `nonparam` = non-parametric bootstrap (default); `bayes` = Bayesian bootstrap.
 #' @param alpha Numeric, significance level of the constructed CIs. By default, 0.05.
 #' @param store.boot Logical, whether to store all the bootstrapped estimates. By default, `FALSE`.
@@ -25,7 +30,7 @@
 #' @importFrom car Anova
 #' @importFrom lmtest waldtest
 #' @importFrom sandwich vcovHC
-#' @importFrom stats anova as.formula coef formula glm hatvalues lm nobs pchisq pf predict quantile rbinom residuals rnorm runif update vcov
+#' @importFrom stats anova as.formula coef complete.cases formula glm hatvalues lm nobs pchisq pf predict quantile rbinom residuals rnorm runif update vcov
 #' @importFrom utils capture.output
 #' @export
 #' @details The RESI, denoted as S, is applicable across many model types. It is a unitless
@@ -156,7 +161,11 @@ resi.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
                          vcov.args = list(), unbiased = TRUE,
                          parallel = c("no", "multicore", "snow"),
                          ncpus = getOption("boot.ncpus", 1L), long = FALSE,
-                         clvar = NULL, ...){
+                         clvar = NULL,
+                         ci.method = c("boot", "qf", "cf", "normal"),
+                         ...){
+
+  ci.method <- match.arg(ci.method)
 
   # check for supported model type
   if(!(any(class(model.full) %in%
@@ -165,10 +174,13 @@ resi.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
   }
   dots = list(...)
 
-  if (missing(data)){
+  data_from_model_frame <- missing(data)
+  if (data_from_model_frame){
     data = model.full$model
-    tryCatch(update(model.full, data = data), error = function(e){
-      message("Updating model fit failed. Try running with providing data argument")})
+    if (ci.method == "boot") {
+      tryCatch(update(model.full, data = data), error = function(e){
+        message("Updating model fit failed. Try running with providing data argument")})
+    }
   }
   else{
     if (!(is.null(model.full$na.action))){
@@ -177,14 +189,38 @@ resi.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
     data = as.data.frame(data)
   }
 
+  # For clustered/GEE models, strip rows with NA in any model variable from data
+  # before constructing model.reduced or bootstrapping. geeglm may not populate
+  # na.action when the model was fitted on already-complete data but the user
+  # passes a data frame with NAs. Use only the columns that appear in model.frame()
+  # to avoid dropping rows with NAs in unrelated columns.
+  if (long) {
+    model_vars <- intersect(names(model.frame(model.full)), names(data))
+    data <- data[complete.cases(data[, model_vars, drop = FALSE]), , drop = FALSE]
+  }
+
   if (is.null(model.reduced) & overall){
     if(!("skip.red" %in% names(dots))){
       form.reduced = as.formula(paste(format(formula(model.full)[[2]]), "~ 1"))
       if (!(form.reduced == formula(model.full))){
-        if(!(is.null(model.full$model)) & !long){
-          model.reduced = try(update(model.full, formula = form.reduced,
-                                      data = model.full$model), silent = T)
-        } else{
+        # How we fit the intercept-only reduced model depends on the data source:
+        #
+        # (a) data was supplied by the user (raw columns, e.g. 'charges'): use the
+        #     expression formula (e.g. log10(charges) ~ 1) so that bootstrap
+        #     replicates (which also have raw columns) can update() successfully.
+        #
+        # (b) data came from model.full$model (the model frame, e.g. column named
+        #     'log10(charges)'): use the backtick-quoted pre-computed column name
+        #     so that update() finds the response without re-evaluating the
+        #     expression on columns that don't exist in the model frame.
+        #     This path is only reached for asymptotic CIs (ci.method != "boot"),
+        #     since bootstrap with a model-frame data warns and is expected to fail.
+        if (data_from_model_frame && !is.null(model.full$model) && !long) {
+          resp_name <- colnames(model.full$model)[1]
+          form.reduced_fit <- as.formula(paste0("`", resp_name, "` ~ 1"))
+          model.reduced = try(update(model.full, formula = form.reduced_fit,
+                                      data = data), silent = T)
+        } else {
           model.reduced = try(update(model.full, formula = form.reduced,
                                       data = data), silent = T)
         }
@@ -204,6 +240,64 @@ resi.default = function(model.full, model.reduced = NULL, data, anova = TRUE,
 
   if (long){
     data = unique(data[, clvar])
+  }
+
+  # ---- asymptotic CIs (skip bootstrap) ----
+  if (ci.method != "boot") {
+    asym_out <- tryCatch(
+      resi_pe_asymptotic(model.full   = model.full,
+                         data         = data,
+                         vcovfunc     = vcovfunc,
+                         coefficients = coefficients,
+                         anova        = anova,
+                         alpha        = alpha,
+                         ci.method    = ci.method,
+                         unbiased     = unbiased,
+                         Anova.args   = Anova.args,
+                         vcov.args    = vcov.args),
+      error = function(e) {
+        warning("Asymptotic CI computation failed: ", conditionMessage(e),
+                "\nFalling back to bootstrap.")
+        NULL
+      }
+    )
+    if (!is.null(asym_out)) {
+      alpha.order <- sort(c(alpha / 2, 1 - alpha / 2))
+      ci_cols     <- paste0(alpha.order * 100, "%")
+      if (coefficients && !is.null(output$coefficients) && !is.null(asym_out$coefficients)) {
+        # Match row names and add CI columns
+        rn <- rownames(output$coefficients)
+        rn_asym <- rownames(asym_out$coefficients)
+        for (col in ci_cols) {
+          if (col %in% colnames(asym_out$coefficients)) {
+            output$coefficients[rn %in% rn_asym, col] <-
+              asym_out$coefficients[rn_asym %in% rn, col]
+          }
+        }
+      }
+      if (anova && !is.null(output$anova) && !is.null(asym_out$anova)) {
+        rn <- rownames(output$anova)
+        rn_asym <- rownames(asym_out$anova)
+        for (col in ci_cols) {
+          if (col %in% colnames(asym_out$anova)) {
+            output$anova[rn %in% rn_asym, col] <-
+              asym_out$anova[rn_asym %in% rn, col]
+          }
+        }
+      }
+      output$ci.method  <- ci.method
+      # Store model and vcov settings so S3 methods can recompute CIs at a
+      # different alpha without re-running resi().
+      output$model.full <- model.full
+      output$vcovfunc   <- vcovfunc
+      output$vcov.args  <- vcov.args
+      output$Anova.args <- Anova.args
+      output$unbiased   <- unbiased
+      class(output) <- "resi"
+      return(output)
+    }
+    # if we fell through (error), continue to bootstrap
+    ci.method <- "boot"
   }
 
   # bootstrapping
@@ -325,17 +419,16 @@ resi.glm = function(model.full, model.reduced = NULL, data, anova = TRUE,
                     vcovfunc = sandwich::vcovHC, alpha = 0.05, store.boot = FALSE,
                     Anova.args = list(), vcov.args = list(), unbiased = TRUE,
                     parallel = c("no", "multicore", "snow"), ncpus = getOption("boot.ncpus", 1L),
-                    ...){
-  dots = list(...)
-  if ("boot.method" %in% names(dots)){
-    stop("\nOnly nonparametric bootstrap supported for model type")
+                    ci.method = "qf",
+                    ...){  dots = list(...)
+  if ("boot.method" %in% names(dots)){    stop("\nOnly nonparametric bootstrap supported for model type")
   }
   resi.default(model.full = model.full, model.reduced = model.reduced, data = data,
                anova = anova, coefficients = coefficients, overall = overall,
                nboot = nboot, vcovfunc = vcovfunc, store.boot = store.boot,
                Anova.args = Anova.args, vcov.args = vcov.args,
                unbiased = unbiased, alpha = alpha, parallel = parallel,
-               ncpus = ncpus, ...)
+               ncpus = ncpus, ci.method = ci.method, ...)
 
 }
 
@@ -347,7 +440,9 @@ resi.lm = function(model.full, model.reduced = NULL, data, anova = TRUE,
                     alpha = 0.05, store.boot = FALSE, Anova.args = list(),
                     vcov.args = list(), unbiased = TRUE,
                     parallel = c("no", "multicore", "snow"),
-                    ncpus = getOption("boot.ncpus", 1L), ...){
+                    ncpus = getOption("boot.ncpus", 1L),
+                    ci.method = "qf",
+                    ...){  
   boot.method = match.arg(tolower(boot.method), choices = c("nonparam", "bayes"))
 
   resi.default(model.full = model.full, model.reduced = model.reduced, data = data,
@@ -355,8 +450,56 @@ resi.lm = function(model.full, model.reduced = NULL, data, anova = TRUE,
                nboot = nboot, vcovfunc = vcovfunc, store.boot = store.boot,
                Anova.args = Anova.args, vcov.args = vcov.args, unbiased = unbiased,
                alpha = alpha, parallel = parallel, ncpus = ncpus,
-               boot.method = boot.method, ...)
+               boot.method = boot.method, ci.method = ci.method, ...)
 
+}
+
+#' @describeIn resi RESI point and interval estimation for lmrob models (robustbase)
+#' @export
+resi.lmrob = function(model.full, model.reduced = NULL, data, anova = TRUE,
+                      coefficients = TRUE, overall = TRUE, nboot = 1000,
+                      boot.method = "nonparam", vcovfunc = stats::vcov,
+                      alpha = 0.05, store.boot = FALSE, Anova.args = list(),
+                      vcov.args = list(), unbiased = TRUE,
+                      parallel = c("no", "multicore", "snow"),
+                      ncpus = getOption("boot.ncpus", 1L),
+                      ci.method = "boot", ...) {
+  # lmrob has a built-in robust sandwich variance; stats::vcov is the natural
+  # default. sandwich::vcovHC also works but is redundant and can be unstable
+  # on bootstrap samples with near-degenerate design matrices.
+  boot.method = match.arg(tolower(boot.method), choices = c("nonparam", "bayes"))
+  resi.default(model.full = model.full, model.reduced = model.reduced, data = data,
+               anova = anova, coefficients = coefficients, overall = overall,
+               nboot = nboot, vcovfunc = vcovfunc, store.boot = store.boot,
+               Anova.args = Anova.args, vcov.args = vcov.args, unbiased = unbiased,
+               alpha = alpha, parallel = parallel, ncpus = ncpus,
+               boot.method = boot.method, ci.method = ci.method, ...)
+}
+
+#' @describeIn resi RESI point and interval estimation for glmrob models (robustbase)
+#' @export
+resi.glmrob = function(model.full, model.reduced = NULL, data, anova = TRUE,
+                       coefficients = TRUE, overall = TRUE, nboot = 1000,
+                       vcovfunc = stats::vcov, alpha = 0.05, store.boot = FALSE,
+                       Anova.args = list(), vcov.args = list(), unbiased = TRUE,
+                       parallel = c("no", "multicore", "snow"),
+                       ncpus = getOption("boot.ncpus", 1L),
+                       ci.method = "boot", ...) {
+  dots = list(...)
+  if ("boot.method" %in% names(dots)){
+    stop("\nOnly nonparametric bootstrap supported for model type")
+  }
+  if (identical(vcovfunc, sandwich::vcovHC)) {
+    vcovfunc <- stats::vcov
+    warning("sandwich::vcovHC is not supported for glmrob objects. ",
+            "Using the model's built-in robust variance (stats::vcov) instead.")
+  }
+  resi.default(model.full = model.full, model.reduced = model.reduced, data = data,
+               anova = anova, coefficients = coefficients, overall = overall,
+               nboot = nboot, vcovfunc = vcovfunc, store.boot = store.boot,
+               Anova.args = Anova.args, vcov.args = vcov.args,
+               unbiased = unbiased, alpha = alpha, parallel = parallel,
+               ncpus = ncpus, ci.method = ci.method, ...)
 }
 
 #' @describeIn resi RESI point and interval estimation for nls models
@@ -504,6 +647,13 @@ resi.geeglm = function(model.full, model.reduced = NULL, data, anova = TRUE,
   else{
     data = as.data.frame(data)
   }
+
+  # Strip rows with NA in any model variable so that mod.dat passed to the
+  # bootstrap contains only the complete cases used in model fitting.
+  # This prevents cluster-size mismatches when geeglm is re-fitted in each
+  # bootstrap replicate.
+  model_vars_gee <- intersect(names(model.frame(model.full)), names(data))
+  data <- data[complete.cases(data[, model_vars_gee, drop = FALSE]), , drop = FALSE]
 
   # id variable name
   id_var = as.character(model.full$call$id)

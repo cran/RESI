@@ -1,0 +1,1308 @@
+# Asymptotic confidence intervals for RESI
+# Implements the normal approximation and quadratic-form (Imhof) CIs described in
+# Zhang et al. (2025) "On the Asymptotic Distribution of the Robust Effect Size Index"
+# and the quadratic-form notes by Vandekar.
+#
+# Exported:
+#   resi_pe_asymptotic()   -- point estimates + asymptotic CIs (both methods)
+#
+# Internal pipeline:
+#   .resi_precompute()     -- model-level sandwich ingredients (once per model)
+#   .resi_contrast()       -- per-contrast whitened vector + Sigma_R
+#   .resi_ci_normal_signed()  -- signed normal CI  (coefficients, m1=1)
+#   .resi_ci_normal_unsigned() -- unsigned truncated normal CI (anova)
+#   .resi_ci_qf()          -- quadratic-form Imhof CI (anova)
+#   .get_L_coef()          -- contrast matrix for a single coefficient
+#   .get_L_anova()         -- contrast matrix for an anova term (Type 2)
+
+
+# ============================================================
+#  Model-level precomputation
+# ============================================================
+
+#' @noRd
+.resi_precompute <- function(model, type = "HC3",
+                             deriv_method = c("corrected", "original", "population", "population2", "zeroB", "zero_phi_cross")) {
+
+  deriv_method <- match.arg(deriv_method)
+
+  type <- match.arg(type, c("HC3", "const", "HC", "HC0", "HC1", "HC2",
+                             "HC4", "HC4m", "HC5"))
+  if (type == "HC") type <- "HC0"
+
+  # ---- basic model objects ----
+  X <- model.matrix(model)
+  if (any(alias <- is.na(coef(model)))) X <- X[, !alias, drop = FALSE]
+  n <- nrow(X)
+  p <- ncol(X)
+  e <- residuals(model, "response")
+
+  # ---- HC leverage weights (applied to mean-parameter rows of psi only) ----
+  h <- hatvalues(model)
+  one_m_h <- pmax(1 - h, .Machine$double.eps)
+  p_int <- max(1L, as.integer(round(sum(h))))
+  sqrtw <- switch(toupper(type),
+    "HC0"  = rep(1, n),
+    "HC1"  = rep(sqrt(n / max(n - p, 1L)), n),
+    "HC2"  = 1 / sqrt(one_m_h),
+    "HC3"  = 1 / one_m_h,
+    "HC4"  = {
+      nhp <- (n / p_int) * h
+      one_m_h^(-pmin(4, nhp) / 2)
+    },
+    "HC4M" = {
+      nhp <- (n / p_int) * h
+      delta <- pmin(1, nhp) + pmin(1.5, nhp)
+      one_m_h^(-delta / 2)
+    },
+    "HC5"  = {
+      nhp <- (n / p_int) * h
+      k <- 0.7
+      deltaCap <- max(4, (n / p_int) * k * max(h))
+      delta <- pmin(nhp, deltaCap)
+      one_m_h^(-delta / 4)
+    },
+    rep(1, n)   # fallback (const handled via is_const below)
+  )
+  is_const <- (type == "const")
+
+  # ============================================================
+  #  lm branch: theta = (phi, beta),  m = p+1
+  # ============================================================
+  if (inherits(model, "lm") && !inherits(model, "glm")) {
+
+    phi <- summary(model)$sigma^2
+    m   <- p + 1L
+
+    # --- per-observation psi and psi' ---
+    psi_list <- lapply(seq_len(n), function(i) {
+      xi <- X[i, , drop = FALSE]        # 1 x p
+      ei <- e[i]
+      psi_phi  <- (ei^2 - phi) / (2 * phi^2)
+      psi_beta <- (ei / phi) * xi
+      cbind(psi_phi, psi_beta)           # 1 x m
+    })
+
+    psiprime_list <- lapply(seq_len(n), function(i) {
+      xi <- X[i, , drop = FALSE]
+      ei <- e[i]
+      d_phi_phi  <- (phi - 2 * ei^2) / (2 * phi^3)
+      d_phi_beta <- -ei * xi / phi^2
+      d_beta_phi <- t(d_phi_beta)
+      d_beta_beta <- -crossprod(xi) / phi
+      rbind(c(d_phi_phi, d_phi_beta),
+            cbind(d_beta_phi, d_beta_beta))
+    })
+
+    # --- A and B matrices ---
+    A_full <- -.resi_mean_list(psiprime_list)
+    A_full <- .resi_sym(A_full)
+    A_inv  <- .resi_safe_inv(A_full)
+
+    # B: HC weights applied to mean-parameter (beta) rows only
+    B_full <- if (is_const) {
+      .resi_mean_outer(psi_list, rep(1, n), lm_phi_row = TRUE)
+    } else {
+      .resi_mean_outer(psi_list, sqrtw, lm_phi_row = TRUE)
+    }
+    B_full <- .resi_sym(B_full)
+
+    cov_theta <- .resi_sym(A_inv %*% B_full %*% A_inv)
+
+    # --- analytic dA/dtheta and dB/dtheta ---
+    XtX_n    <- crossprod(X) / n
+    XtX_n_hc <- if (is_const) XtX_n else crossprod(X * sqrtw) / n
+
+    # dA/d_phi: phi column shared base (same starting point for v1 and v2).
+    # The (phi,phi) element: population approx gives -1/phi^3 (from A_pp=1/(2phi^2));
+    # sample version gives (phi - 3*mean(e^2))/phi^4, which is corrected in v2 below.
+    # The (beta,beta) block -XtX_n/phi^2 is exact for both (X'X/phi doesn't depend on phi via e).
+    dA_phi <- rbind(
+      cbind(-1 / phi^3,     matrix(0, 1, p)),
+      cbind(matrix(0, p, 1), -XtX_n / phi^2)
+    )
+    dA_dtheta <- matrix(0, m * m, m)
+    dA_dtheta[, 1] <- as.vector(dA_phi)
+
+    # dB/dtheta: two implementations selected by deriv_method.
+    # "original" (v1): original code before corrections -- kept for comparison.
+    # "corrected" (v2): corrected dB/dphi off-diagonals + nonzero dB/dbeta columns.
+    e4mean <- mean(e^4)
+    dB_dtheta <- matrix(0, m * m, m)
+
+    if (deriv_method == "original") {
+      # ---- v1: original formulas (kept for comparison) ----
+      # Errors: (a) dB_phi-phi used (phi^2-2*e4mean) [wrong factor]; (b) dB_phi-beta
+      # factored as colMeans(X)*e3mean [wrong]; (c) dB_beta-beta used -XtX_hc/phi^2
+      # [wrong power/missing e^2]; (d) all dB/dbeta_l = 0.
+      e3mean <- mean(e^3)
+      dB_phi_v1 <- rbind(
+        cbind((phi^2 - 2 * e4mean) / phi^5,
+              -(3 / (2 * phi^4)) * t(colMeans(X) * e3mean)),
+        cbind(-(3 / (2 * phi^4)) * colMeans(X) * e3mean,
+              -XtX_n_hc / phi^2)
+      )
+      dB_dtheta[, 1] <- as.vector(dB_phi_v1)
+      # dB/dbeta columns: all zero (v1 approximation)
+
+    } else {
+      # ---- v2+: corrected formulas ----
+      # 'corrected'    : sample-level derivatives for all blocks (exact FD match).
+      # 'population'   : beta-beta block of dB/dbeta_l = 0.
+      # 'population2'  : all beta columns of dB = 0.
+      # 'zeroB'          : dB_dtheta = 0 entirely (only A-chain contributes).
+      #                    Diagnostic: removes B-chain; unrealistic since B depends on phi.
+      # 'zero_phi_cross' : population + phi-beta cross block of dB/dphi set to zero.
+      #                    Tests whether E[e^3 x_j] cross terms in dB/dphi matter.
+
+      if (deriv_method != "zeroB") {
+        # ---- dB/dphi (phi column of dB_dtheta) ----
+        # phi-beta cross block: zeroed for zero_phi_cross, sample-level otherwise
+        e3_X_w <- if (deriv_method == "zero_phi_cross") {
+          rep(0, p)          # phi-beta cross = 0
+        } else {
+          if (is_const) colMeans(e^3 * X)
+          else          colMeans(sqrtw * e^3 * X)
+        }
+        B_beta <- B_full[2:m, 2:m, drop = FALSE]   # p x p beta-beta block of B
+
+        dB_phi_v2 <- rbind(
+          cbind((phi^2 - e4mean) / phi^5,
+                -(3 / (2 * phi^4)) * t(e3_X_w)),
+          cbind(-(3 / (2 * phi^4)) * e3_X_w,
+                -2 / phi * B_beta)
+        )
+        dB_dtheta[, 1] <- as.vector(dB_phi_v2)
+
+        # ---- dB/dbeta_l columns (l = 1,...,p; column index 1+l) ----
+        # e2_m_phi_e <- (e^2 - phi) * e  
+        e2_m_phi_e <- e^3
+        # had a minus phi, but that is pre expectation                                # n-vector
+        v_3e2      <- if (is_const) 3 * e^2  - phi                    # no HC weight for const
+                      else sqrtw * (3 * e^2 - phi)                      # HC-weighted
+        # d_phi_phi_betas[l] = dB_{phi,phi} / d_beta_l
+        d_phi_phi_betas  <- -colMeans(e2_m_phi_e * X) / phi^4          # p-vector
+        # dB_phi_beta_beta[j,l] = dB_{phi,beta_j} / d_beta_l
+        dB_phi_beta_beta <- -crossprod(X, v_3e2 * X) / (2 * n * phi^3) # p x p
+
+        # Precompute HC squared weights for the beta-beta block
+        tau_eff <- if (is_const) e else sqrtw^2 * e   # tau_i * e_i (n-vector)
+
+        for (l in seq_len(p)) {
+          dB_l <- matrix(0, m, m)
+          if (deriv_method == "population2") {
+            # entire beta column zeroed: phi-phi, phi-beta, and beta-beta blocks all 0
+          } else {
+            dB_l[1L, 1L]  <- d_phi_phi_betas[l]
+            dB_l[1L, 2:m] <- dB_phi_beta_beta[, l]
+            dB_l[2:m, 1L] <- dB_phi_beta_beta[, l]   # B is symmetric
+            if (deriv_method == "corrected") {
+              v_l             <- tau_eff * X[, l]       # n-vector: tau_i e_i x_il
+              dB_l[2:m, 2:m] <- -2 / phi^2 * crossprod(X, v_l * X) / n
+            }
+            # population, zero_phi_cross: beta-beta block left as 0
+          }
+          dB_dtheta[, 1L + l] <- as.vector(dB_l)
+        }
+      }
+      # zeroB: dB_dtheta remains all zeros (initialized above)
+
+      # Sample-level dA/dphi phi-phi element:
+      # d(A_pp)/dphi = (phi - 3*mean(e^2))/phi^4  [exact sample derivative]
+      # The population approx A_pp = 1/(2phi^2) gives d/dphi = -1/phi^3;
+      # at E[e^2]=phi these differ by factor 2.
+      e2mean <- mean(e^2)
+      dA_dtheta[1L, 1L] <- (phi - 3 * e2mean) / phi^4
+
+      # Sample-level dA/d_beta_l: phi-beta cross block is -(X'X/n)_{jl}/phi^2.
+      # d(A_pb_j)/d_beta_l = d/d_beta_l [mean(e*x_j/phi^2)] = -mean(x_j*x_l)/phi^2
+      #                     = -(X'X/n)_{jl}/phi^2  (nonzero even at MLE)
+      # d(A_pp)/d_beta_l   = -2*mean(e*x_l)/phi^3  (= 0 exactly at OLS MLE)
+      # d(A_bb_jk)/d_beta_l = 0  (X'X/n/phi doesn't depend on beta)
+      e_X_means <- colMeans(e * X)  # mean(e*x_l) -- p-vector, 0 exactly at OLS MLE
+      for (l in seq_len(p)) {
+        dA_l <- matrix(0, m, m)
+        dA_l[1L, 1L]  <- -2 * e_X_means[l] / phi^3  # 0 at OLS MLE
+        dA_l[1L, 2:m] <- -XtX_n[, l] / phi^2        # phi-beta cross
+        dA_l[2:m, 1L] <- -XtX_n[l, ] / phi^2        # symmetric
+        dA_dtheta[, 1L + l] <- as.vector(dA_l)
+      }
+    }
+
+    theta_hat <- c(phi, coef(model))
+    lm_model  <- TRUE
+
+  # ============================================================
+  #  GLM branch: theta = beta,  m = p
+  # ============================================================
+  } else if (inherits(model, "glm")) {
+
+    m <- p
+    lm_model <- FALSE
+    phi <- NULL
+
+    ef    <- sandwich::estfun(model)
+    ef    <- ef[, colnames(X), drop = FALSE]
+    w_vec <- weights(model, type = "working")
+    mu_hat <- pmin(pmax(fitted(model), .Machine$double.eps),
+                   1 - .Machine$double.eps)
+
+    psi_list      <- lapply(seq_len(n), function(i)
+      matrix(ef[i, ], nrow = 1))
+    psiprime_list <- lapply(seq_len(n), function(i)
+      -w_vec[i] * crossprod(X[i, , drop = FALSE]))
+
+    A_full <- -.resi_mean_list(psiprime_list)
+    A_full <- .resi_sym(A_full)
+    A_inv  <- .resi_safe_inv(A_full)
+
+    B_full <- if (is_const) {
+      .resi_mean_outer(psi_list, rep(1, n), lm_phi_row = FALSE)
+    } else {
+      .resi_mean_outer(psi_list, sqrtw, lm_phi_row = FALSE)
+    }
+    B_full <- .resi_sym(B_full)
+
+    cov_theta <- .resi_sym(A_inv %*% B_full %*% A_inv)
+
+    # analytic dA/dtheta (= dB/dtheta under canonical link)
+    dA_dtheta <- matrix(0, m * m, m)
+    for (j in seq_len(m)) {
+      vj <- w_vec * (1 - 2 * mu_hat) * X[, j]
+      dA_dtheta[, j] <- as.vector(crossprod(X, vj * X) / n)
+    }
+    dB_dtheta <- dA_dtheta
+
+    theta_hat <- coef(model)
+
+  } else {
+    stop(".resi_precompute: model class not supported (lm or glm only)")
+  }
+
+  list(
+    model        = model,
+    X            = X,
+    n            = n,
+    p            = p,
+    m            = m,
+    lm_model     = lm_model,
+    phi          = phi,
+    theta_hat    = theta_hat,
+    A_inv        = A_inv,
+    B_full       = B_full,
+    cov_theta    = cov_theta,
+    dA_dtheta    = dA_dtheta,
+    dB_dtheta    = dB_dtheta,
+    deriv_method = deriv_method,
+    is_const     = is_const,
+    type         = type,
+    psi_list     = psi_list,
+    sqrtw        = sqrtw
+  )
+}
+
+
+# ============================================================
+#  Per-contrast computation
+# ============================================================
+
+#' @noRd
+#' @param precomp output of .resi_precompute()
+#' @param L_model contrast matrix in *beta* (coefficient) space (m1 x p)
+#' @param vcovmat_n Optional matrix n * vcovfunc(model) in beta space (p x p).
+#'   When supplied, used for Sigma_beta so that Stilde targets the same population
+#'   quantity as the vcovfunc-based point estimate. cov_theta (from precomp) is
+#'   still used for Sigma_R via the delta method.
+#' @return list with R_beta, Stilde, dR_dtheta (m1 x m), Sigma_R (m1 x m1),
+#'         beta_hat, Sigma_beta, m1
+.resi_contrast <- function(precomp, L_model, vcovmat_n = NULL) {
+
+  m1     <- nrow(L_model)
+  m      <- precomp$m
+  n      <- precomp$n
+  A_inv  <- precomp$A_inv
+  Sig    <- precomp$cov_theta     # m x m  (used for Sigma_R)
+  dA     <- precomp$dA_dtheta     # m^2 x m
+  dB     <- precomp$dB_dtheta     # m^2 x m
+
+  # Extend L to theta space: prepend column of zeros for phi if lm
+  L <- if (precomp$lm_model) cbind(0, L_model) else L_model  # m1 x m
+
+  # ---- point estimate ----
+  beta_hat <- drop(L %*% precomp$theta_hat)           # m1
+
+  # Sigma_beta: use vcovmat_n (vcovfunc-based, in beta space) when supplied so
+  # that Stilde is consistent with the vcovfunc-based RESI point estimate.
+  # Note: cov_theta[beta,beta] ≈ n * vcovHC, so for the default HC3 vcovfunc
+  # this is numerically transparent; it matters when vcovfunc != type.
+  Sigma_beta <- if (!is.null(vcovmat_n)) {
+    .resi_sym(L_model %*% vcovmat_n %*% t(L_model))
+  } else {
+    .resi_sym(L %*% Sig %*% t(L))
+  }
+
+  # ---- EVD of Sigma_beta ----
+  eig <- eigen(Sigma_beta, symmetric = TRUE)
+  d   <- pmax(eig$values, .Machine$double.eps)         # eigenvalues (m1)
+  V   <- eig$vectors                                   # m1 x m1
+
+  sqrtd <- sqrt(d)
+  Phat  <- V %*% diag(1 / sqrtd, m1) %*% t(V)         # Sigma_beta^{-1/2}
+
+  R_beta <- Phat %*% beta_hat                          # m1-vector, whitened RESI
+  Stilde <- sqrt(sum(R_beta^2))                        # ||R_beta||
+
+  # ---- Lyapunov weight matrix ----
+  # W[j,k] = 1 / (sqrt(d[j]) * sqrt(d[k]) * (sqrt(d[j]) + sqrt(d[k])))
+  W <- outer(sqrtd, sqrtd, function(a, b) 1 / (a * b * (a + b)))  # m1 x m1
+
+  VT_beta <- drop(t(V) %*% beta_hat)   # m1-vector (V-basis projection of beta_hat)
+
+  # ---- dR_dtheta: m1 x m matrix ----
+  direct <- Phat %*% L                   # (a) direct term: m1 x m
+
+  Achain <- matrix(0, m1, m)
+  Bchain <- matrix(0, m1, m)
+  for (k in seq_len(m)) {
+    # (b) A-chain
+    dA_k     <- matrix(dA[, k], m, m)
+    dSig_A   <- -(A_inv %*% dA_k %*% Sig + Sig %*% dA_k %*% A_inv)
+    dSigB_A  <- L %*% dSig_A %*% t(L)
+    M_A      <- t(V) %*% dSigB_A %*% V  # m1 x m1 in V-basis
+    Achain[, k] <- -V %*% (W * M_A) %*% VT_beta
+
+    # (c) B-chain (zero for parametric / const)
+    if (!precomp$is_const) {
+      dB_k     <- matrix(dB[, k], m, m)
+      dSig_B   <- A_inv %*% dB_k %*% A_inv
+      dSigB_B  <- L %*% dSig_B %*% t(L)
+      M_B      <- t(V) %*% dSigB_B %*% V
+      Bchain[, k] <- -V %*% (W * M_B) %*% VT_beta
+    }
+  }
+
+  dR_dtheta <- direct + Achain + Bchain   # m1 x m
+
+  # ---- Sigma_R = Cov(sqrt(n) R_hat) ----
+  Sigma_R <- dR_dtheta %*% Sig %*% t(dR_dtheta)   # m1 x m1
+  Sigma_R <- .resi_sym(Sigma_R)
+
+  # ---- HC-weighted influence values (for CF skewness; m1=1 only) ----
+  # phi_tilde_i = (dR_dtheta %*% A_inv) %*% psi_tilde_i  (scalar when m1=1)
+  # where psi_tilde applies HC weights consistent with B_full.
+  phi_tilde <- NULL
+  if (m1 == 1L && !is.null(precomp$psi_list)) {
+    c_vec <- drop(dR_dtheta %*% A_inv)   # length-m row vector
+    phi_tilde <- vapply(seq_len(n), function(i) {
+      psi_i <- drop(precomp$psi_list[[i]])   # length m
+      if (precomp$lm_model) {
+        # phi (element 1) unweighted; beta rows (2:m) weighted
+        psi_i[seq(2L, precomp$m)] <- psi_i[seq(2L, precomp$m)] * precomp$sqrtw[i]
+      } else {
+        psi_i <- psi_i * precomp$sqrtw[i]
+      }
+      sum(c_vec * psi_i)
+    }, numeric(1L))
+  }
+
+  list(
+    m1         = m1,
+    n          = n,
+    beta_hat   = beta_hat,
+    Sigma_beta = Sigma_beta,
+    R_beta     = R_beta,
+    Stilde     = Stilde,
+    dR_dtheta  = dR_dtheta,
+    dR_direct  = direct,      # m1 x m: direct (Phat*L) contribution
+    dR_Achain  = Achain,      # m1 x m: A-chain contribution
+    dR_Bchain  = Bchain,      # m1 x m: B-chain contribution
+    Sigma_R    = Sigma_R,
+    phi_tilde  = phi_tilde
+  )
+}
+
+
+# ============================================================
+#  CI functions
+# ============================================================
+
+#' Signed Cornish-Fisher CI for a single coefficient (m1 = 1)
+#'
+#' Uses the closed-form CF inversion: since q_p(s) is linear in s, the CI
+#' S_pm ± se * w_p inverts to exact bounds without root-finding.
+#' gamma1 and gamma2 are estimated from the HC-weighted influence functions
+#' phi_tilde stored in `contrast$phi_tilde`.
+#' @noRd
+.resi_ci_cf_signed <- function(contrast, alpha = 0.05) {
+  Sigma_R   <- as.numeric(contrast$Sigma_R)   # scalar
+  n         <- contrast$n
+  R_beta    <- drop(contrast$R_beta)           # signed scalar S_pm
+  phi_tilde <- contrast$phi_tilde              # n-vector, NULL if unavailable
+
+  se <- sqrt(max(Sigma_R, .Machine$double.eps) / n)
+
+  # if (is.null(phi_tilde) || length(phi_tilde) != n) {
+  #   # phi_tilde not available (shouldn't happen in normal use)
+  #   return(.resi_ci_normal_signed(contrast, alpha = alpha))
+  # }
+
+  # Standardized cumulants of Z_n = sqrt(n) * (S_pm - S_true) / sqrt(Sigma_R)
+  # where phi_tilde are the HC-weighted influence values and Sigma_R = mean(phi^2).
+  #
+  # gamma1 = kappa_3(Z_n) = n^{-1/2} * mean(phi^3) / Sigma_R^{3/2}
+  # gamma2 = kappa_4(Z_n) = n^{-1}   * (mean(phi^4) / Sigma_R^2 - 3)
+  #
+  # Both are O(n^{-1/2}) and O(n^{-1}) respectively, and -> 0 as n -> inf
+  # for any distribution with finite fourth moment (CLT rate).
+  m3     <- mean(phi_tilde^3)
+  m4     <- mean(phi_tilde^4)
+  gamma1 <- m3 / (sqrt(n) * Sigma_R^(3 / 2))
+  gamma2 <- (m4 / Sigma_R^2 - 3) / n
+
+  cf_w <- function(p) {
+    z <- qnorm(p)
+    z +
+      (gamma1      / 6 ) * (z^2 - 1) +
+      (gamma2      / 24) * (z^3 - 3 * z) -
+      (gamma1^2    / 36) * (2 * z^3 - 5 * z)
+  }
+
+  # These are the correct intervals
+  # Closed-form: LCI = S_pm - se * w_{1-alpha/2},  UCI = S_pm - se * w_{alpha/2}
+  LCI <- R_beta - se * cf_w(1 - alpha / 2)
+  UCI <- R_beta - se * cf_w(    alpha / 2)
+  # these are incorrect, but more align with the percentile bootstrap, which seems to do better for some reason
+  # this code was just to investigate if this is more similar to that.
+  # UCI <- R_beta + se * cf_w(1 - alpha / 2)
+  # LCI <- R_beta + se * cf_w(    alpha / 2)
+
+  c(LCI = LCI, UCI = UCI)
+}
+
+#' Signed normal CI for a single coefficient (m1 = 1)
+#' @noRd
+.resi_ci_normal_signed <- function(contrast, alpha = 0.05) {
+  Sigma_R <- contrast$Sigma_R  # scalar (1x1)
+  n       <- contrast$n
+  Stilde  <- contrast$Stilde   # |Z|/sqrt(n) sign preserved via R_beta sign
+  R_beta  <- contrast$R_beta   # signed (scalar)
+
+  # signed: S_pm = R_beta (= Z/sqrt(n) when m1=1, Sigma_beta=1)
+  S_signed <- R_beta   # scalar
+  # Floor SE at 1/sqrt(n): asymptotically Sigma_R -> 1 under H0, but near-null
+  # sandwich estimates can collapse below 1, shrinking the CI inappropriately.
+  # se       <- max(sqrt(as.numeric(Sigma_R) / n), 1 / sqrt(n))
+  se       <- sqrt(as.numeric(Sigma_R) / n)
+  z        <- qnorm(1 - alpha / 2)
+  c(LCI = S_signed - z * se, UCI = S_signed + z * se)
+}
+
+#' Unsigned truncated normal CI (anova, m1 >= 1)
+#' @noRd
+.resi_ci_normal_unsigned <- function(contrast, alpha = 0.05) {
+  Sigma_R <- contrast$Sigma_R   # m1 x m1
+  R_beta  <- contrast$R_beta    # m1
+  Stilde  <- contrast$Stilde
+  n       <- contrast$n
+  m1      <- contrast$m1
+
+  # df-corrected center: Shat = sqrt(max(0, Stilde^2 - m1/n))
+  # Aligns CI center with chisq2S point estimator; same correction as QF CI.
+  Shat <- sqrt(max(0, Stilde^2 - m1 / n))
+
+  # Null upper bound: (1-alpha) quantile of Stilde under H0.
+  # Under H0, sqrt(n)*||R_hat|| ~ ||N(0, I_m1)|| = chi(m1) because Sigma_R -> I
+  # asymptotically. So P(Stilde >= UCI | S=0) = alpha gives
+  # UCI = sqrt(qchisq(1-alpha, df=m1) / n).
+  # For m1=1: sqrt(qchisq(1-alpha, 1)/n) = qnorm(1-alpha/2)/sqrt(n).
+  UCI_null <- sqrt(qchisq(1 - alpha, df = m1) / n)
+
+  if (Shat <= 0) {
+    return(c(LCI = 0, UCI = UCI_null))
+  }
+
+  u       <- R_beta / Stilde                              # unit direction
+  sigma2S <- as.numeric(t(u) %*% Sigma_R %*% u)         # scalar variance
+  # Floor SE at sqrt(m1/n): asymptotically tr(Sigma_R) -> m1 under H0, but
+  # near-null sandwich estimates can underestimate, shrinking the CI.
+  # se      <- max(sqrt(pmax(sigma2S, 0) / n), sqrt(m1 / n))
+  se      <- sqrt(pmax(sigma2S, 0) / n)
+
+  # truncate_ci handles boundary; centered at Shat
+  bounds <- .resi_truncate_ci(Shat, se, n, m1, alpha)
+
+  # When LCI clips to 0, the directional delta-method UCI can underestimate
+  # spread for m1>1 (single-direction 1D normal vs chi(m1) null distribution).
+  # Use the chi(m1) null upper as a floor.
+  if (bounds[1] == 0) {
+    bounds[2] <- max(bounds[2], UCI_null)
+  }
+
+  c(LCI = bounds[1], UCI = bounds[2])
+}
+
+#' Quadratic-form Imhof CI (anova, m1 >= 1)
+#' @noRd
+.resi_ci_qf <- function(contrast, alpha = 0.05) {
+  Sigma_R <- contrast$Sigma_R
+  R_beta  <- contrast$R_beta
+  Stilde  <- contrast$Stilde
+  n       <- contrast$n
+  m1      <- contrast$m1
+
+  # T2_obs  <- max(0, n * Stilde^2 - m1)    # df-corrected test statistic (Shat^2 * n)
+  # Shat    <- sqrt(T2_obs / n)              # df-corrected point estimate (for search bounds only)
+  T2_obs <- n * Stilde^2                  # raw test statistic
+  Shat   <- sqrt(max(0, Stilde^2 - m1/n)) # (for search bounds only)
+
+  # EVD of Sigma_R
+  eigR       <- eigen(Sigma_R, symmetric = TRUE)
+  lambda     <- pmax(eigR$values, .Machine$double.eps)
+  U          <- eigR$vectors
+
+  # Estimated non-centrality direction (unit length in U-basis)
+  delta_unit <- if (Stilde > 0) drop(t(U) %*% R_beta) / Stilde else
+    rep(0, length(lambda))
+
+  # Normal-approx SE of Stilde (for search interval sizing).
+  # Delta-method: se_S = sqrt(u^T Sigma_R u / n), u = R_beta/Stilde.
+  # Under H0, n*Stilde^2 ~ chi^2_{m1}, so Var(Stilde) -> m1/(2n) * (2/m1) = 1/n
+  # giving SD(Stilde) ~ sqrt(m1/n) / sqrt(2) ... more precisely the SD of
+  # chi(m1)/sqrt(n) is sqrt(m1/n) (since Var(chi(m1)) ~ m1 for large m1).
+  # Use sqrt(m1/n) as a floor so the bracket is never degenerate near null.
+  u_dir        <- if (Stilde > 0) R_beta / Stilde else eigR$vectors[, 1]
+  sigma2S      <- as.numeric(t(u_dir) %*% Sigma_R %*% u_dir)
+  se_S_delta   <- sqrt(pmax(sigma2S / n, .Machine$double.eps))
+  se_S_floor   <- sqrt(m1 / n)
+  se_S         <- max(se_S_delta, se_S_floor)
+
+  # nc_k = n * S_b^2 * delta_unit_k^2 / lambda_k  (non-centrality for chi^2_1 k-th term)
+  nc_fun <- function(S_b) n * S_b^2 * delta_unit^2 / lambda
+
+  # Probability function P(Q(S_b) >= T2_obs)
+  # For m1=1: use pchisq (no imhof precision issues)
+  # For m1>1: use imhof
+  if (m1 == 1L) {
+    q <- T2_obs / lambda[1]
+    # For large q or ncp, use the exact identity chi^2(1,lambda) = (Z + sqrt(lambda))^2:
+    #   P(chi^2(1,lambda) >= q) = pnorm(sqrt(lambda) - sqrt(q)) + pnorm(-sqrt(lambda) - sqrt(q))
+    # This avoids pnchisq convergence failures (which arise when q and ncp are both large,
+    # e.g. ~1e12, as happens in ill-conditioned GLMs at small n).  The formula is
+    # algebraically exact and pnorm is numerically stable at arbitrarily large arguments.
+    prob_fn <- function(S_b) {
+      nc <- nc_fun(S_b)
+      if (!is.finite(nc)) return(1.0)
+      if (q > 1e4 || nc > 1e4) {
+        sq  <- sqrt(max(q,  0))
+        snc <- sqrt(max(nc, 0))
+        return(pnorm(snc - sq, lower.tail = FALSE) + pnorm(-snc - sq))
+      }
+      pchisq(q, df = 1, ncp = nc, lower.tail = FALSE)
+    }
+  } else {
+    prob_fn <- function(S_b) {
+      nc <- nc_fun(S_b)
+      # Cap individual non-centrality components to avoid imhof overflow
+      nc <- pmin(nc, 1e10 * max(T2_obs, 1))
+      suppressWarnings(CompQuadForm::imhof(T2_obs, lambda = lambda, delta = nc)$Qq)
+    }
+  }
+
+  # ---- Lower bound ----
+  # P(Q(0)) = P(central weighted chi-sq >= T2_obs)
+  p0 <- prob_fn(0)
+  if (is.na(p0) || p0 < 0) p0 <- 0   # imhof can return negative for extreme cases
+
+  if (p0 >= alpha / 2) {
+    LCI <- 0
+  } else {
+    lower_candidates <- Shat * c(0.9, 0.7, 0.5, 0.3, 0.1)
+    bracket_lo <- NA_real_
+    for (lo in lower_candidates) {
+      plo <- tryCatch(prob_fn(lo), error = function(e) NA_real_)
+      if (!is.na(plo) && is.finite(plo) && plo >= 0 && plo < alpha / 2) {
+        bracket_lo <- lo
+        break
+      }
+    }
+    if (is.na(bracket_lo)) bracket_lo <- 0
+
+    LCI <- tryCatch(
+      uniroot(function(s) prob_fn(s) - alpha / 2,
+              lower = bracket_lo, upper = Stilde,
+              tol = se_S * 1e-3, extendInt = "upX")$root,
+      error = function(e) {
+        warning("QF lower CI bound search failed; using 0.")
+        0
+      }
+    )
+    LCI <- max(LCI, 0)
+  }
+
+  # ---- Upper bound ----
+  # When p0 = P(Q(0) >= T2_obs) >= 1-alpha/2, T2_obs falls in the lower alpha/2
+  # tail of the null distribution. Strict test inversion gives an empty upper set
+  # because prob_fn is increasing and never drops to 1-alpha/2. Fallback: use the
+  # (1-alpha) quantile of Stilde under H0: n*Stilde^2 ~ chi^2_{m1}, so
+  # UCI_null = sqrt(qchisq(1-alpha, df=m1) / n). Same formula as the normal CI.
+  # The same fallback is used when the bracket search fails.
+  # Null upper bound: (1-alpha) quantile of Stilde under H0.
+  # Under H0, n*Stilde^2 ~ chi^2_{m1} asymptotically, so
+  # UCI_null = sqrt(qchisq(1-alpha, df=m1) / n).
+  UCI_null <- sqrt(qchisq(1 - alpha, df = m1) / n)
+
+  if (p0 >= 1 - alpha / 2) {
+    # T2_obs is in the lower alpha/2 tail of the null distribution;
+    # strict test inversion gives an empty upper set. Use the null upper bound.
+    UCI <- UCI_null
+  } else {
+    # Normal case: uniroot in (Shat, bracket_up) where prob_fn crosses 1-alpha/2
+    upper_search <- Shat + se_S * c(3, 6, 12, 25, 50, 100) * qnorm(1 - alpha / 2)
+    bracket_up   <- NA_real_
+    for (up in upper_search) {
+      pup <- tryCatch(prob_fn(up), error = function(e) NA_real_)
+      if (is.na(pup) || !is.finite(pup) || pup >= 1 - alpha / 2) {
+        bracket_up <- up; break
+      }
+    }
+    if (is.na(bracket_up)) {
+      UCI <- UCI_null
+    } else {
+      UCI <- tryCatch(
+        uniroot(function(s) {
+          p <- prob_fn(s)
+          if (is.na(p) || !is.finite(p)) return(1 - (1 - alpha / 2))
+          p - (1 - alpha / 2)
+        },
+                lower = Stilde, upper = bracket_up,
+                tol = se_S * 1e-3)$root,
+        error = function(e) UCI_null
+      )
+    }
+  }
+
+  c(LCI = max(LCI, 0), UCI = UCI)
+}
+
+#' Cornish-Fisher test-inversion CI (anova, m1 >= 1)
+#'
+#' Inverts the Cornish-Fisher approximation to the generalized non-central
+#' chi-square distribution of T^2 = n*Stilde^2.  Uses the exact cumulants of
+#' sum_k lambda_k (Z_k + delta_k)^2, with lambda_k the eigenvalues of
+#' Sigma_R and delta_k scaled so that sum delta_k^2 = n*S_b^2.
+#' @noRd
+.resi_ci_cf <- function(contrast, alpha = 0.05) {
+  Sigma_R <- contrast$Sigma_R
+  R_beta  <- contrast$R_beta
+  Stilde  <- contrast$Stilde
+  n       <- contrast$n
+  m1      <- contrast$m1
+
+  T2_obs <- n * Stilde^2
+  Shat   <- sqrt(max(0, Stilde^2 - m1 / n))   # df-corrected; used for bracket sizing only
+
+  # ---- Cumulant ingredients (matrix powers, no EVD needed) ----
+  # c_r = tr(Sigma_R^r),  v_r = R' Sigma_R^{r-1} R / Stilde^2
+  SigR2 <- Sigma_R %*% Sigma_R          # Sigma_R^2 (m1 x m1)
+  c1 <- sum(diag(Sigma_R))              # tr(Sigma_R)
+  c2 <- sum(Sigma_R * Sigma_R)          # tr(Sigma_R^2) = ||Sigma_R||_F^2 (symmetric)
+  c3 <- sum(diag(SigR2 %*% Sigma_R))   # tr(Sigma_R^3)
+  c4 <- sum(SigR2 * SigR2)             # tr(Sigma_R^4) = ||Sigma_R^2||_F^2
+
+  if (Stilde > 0) {
+    SigR_Rb  <- drop(Sigma_R %*% R_beta)       # Sigma_R   R
+    SigR2_Rb <- drop(SigR2   %*% R_beta)       # Sigma_R^2 R
+    SigR3_Rb <- drop(SigR2   %*% SigR_Rb)      # Sigma_R^3 R
+    v2 <- sum(R_beta * SigR_Rb)  / Stilde^2    # R' Sigma   R / Stilde^2
+    v3 <- sum(R_beta * SigR2_Rb) / Stilde^2    # R' Sigma^2 R / Stilde^2
+    v4 <- sum(R_beta * SigR3_Rb) / Stilde^2    # R' Sigma^3 R / Stilde^2
+  } else {
+    v2 <- v3 <- v4 <- 0
+  }
+
+  # ---- SE for bracket sizing ----
+  u_dir   <- if (Stilde > 0) R_beta / Stilde else c(1, rep(0, m1 - 1))
+  sigma2S <- as.numeric(t(u_dir) %*% Sigma_R %*% u_dir)
+  se_S    <- max(sqrt(pmax(sigma2S / n, .Machine$double.eps)), sqrt(m1 / n))
+
+  # ---- Cornish-Fisher quantile: q_p(S_b) ----
+  # p-th quantile of T^2 under S_true = S_b, using the 4-term CF expansion
+  # through the gamma1^2 correction (standard second-order accurate expansion).
+  #   kappa_r = 2^{r-1}(r-1)! * [c_r + r * n*S_b^2 * v_r]
+  #   gamma1 = kappa3 / sigma^3,  gamma2 = kappa4 / sigma^4
+  #   q_p = mu + sigma * [z + gamma1/6*(z^2-1) + gamma2/24*(z^3-3z) - gamma1^2/36*(2z^3-5z)]
+  cf_quant <- function(S_b, p) {
+    nSb2  <- n * S_b^2
+    mu    <- c1 + nSb2
+    var_q <- 2 * (c2 + 2 * nSb2 * v2)
+    if (!is.finite(var_q) || var_q <= 0) return(NA_real_)
+    sigma  <- sqrt(var_q)
+    kappa3 <- 8  * (c3 + 3 * nSb2 * v3)
+    kappa4 <- 48 * (c4 + 4 * nSb2 * v4)
+    gamma1 <- kappa3 / sigma^3
+    gamma2 <- kappa4 / sigma^4
+    z <- qnorm(p)
+    w <- z +
+      (gamma1 / 6)      * (z^2 - 1) +
+      (gamma2 / 24)     * (z^3 - 3 * z) -
+      (gamma1^2 / 36)   * (2 * z^3 - 5 * z)
+    mu + sigma * w
+  }
+
+  # ---- Null upper bound and boundary conditions ----
+  # Use chi-square tail probability for the boundary checks.  The CF series
+  # can diverge near S_b = 0 (gamma1 is large for the central distribution),
+  # so we use the exact chi-square approximation there -- the same approach
+  # as the QF CI.  CF is only applied for the inversion at nonzero S_b.
+  UCI_null <- sqrt(qchisq(1 - alpha, df = m1) / n)
+
+  # P(T2 >= T2_obs | S = 0) under chi^2_{m1} approximation
+  p0 <- pchisq(T2_obs, df = m1, lower.tail = FALSE)
+
+  # Degenerate: no signal at all
+  if (T2_obs == 0) return(c(LCI = 0, UCI = UCI_null))
+
+  # ---- Lower bound ----
+  # LCI = 0 when the null distribution already has >= alpha/2 probability above T2_obs.
+  if (p0 >= alpha / 2) {
+    LCI <- 0
+  } else {
+    # Before calling uniroot, verify that the CF quantile at S_b = 0 is actually
+    # below T2_obs.  The chi-square boundary check (p0 < alpha/2) guarantees this
+    # for the exact chi-square distribution, but the CF expansion can overestimate
+    # the null quantile (large gamma1 for small m1 / small n), giving
+    # cf_quant(0, 1-alpha/2) > T2_obs even when p0 < alpha/2.  In that case the
+    # root does not exist in [0, Stilde] and LCI = 0 by the CF approximation.
+    q0_cf <- tryCatch(cf_quant(0, 1 - alpha / 2), error = function(e) NA_real_)
+    if (is.na(q0_cf) || q0_cf >= T2_obs) {
+      LCI <- 0
+    } else {
+      # CF inversion: solve q_{1-alpha/2}(S_L) = T2_obs in (0, Stilde).
+      # At S_b = Stilde: q_{1-alpha/2}(Stilde) = c1 + T2_obs + sigma*(positive) > T2_obs.
+      LCI <- tryCatch(
+        uniroot(function(s) cf_quant(s, 1 - alpha / 2) - T2_obs,
+                lower = 0, upper = Stilde,
+                tol = se_S * 1e-3, extendInt = "upX")$root,
+        error = function(e) {
+          warning("CF lower CI bound search failed; using 0.")
+          0
+        }
+      )
+      LCI <- max(LCI, 0)
+    }
+  }
+
+  # ---- Upper bound ----
+  # UCI = UCI_null when T2_obs falls in the lower tail of the null distribution.
+  if (p0 >= 1 - alpha / 2) {
+    UCI <- UCI_null
+  } else {
+    # Bracket upper: find S_b where q_{alpha/2}(S_b) first exceeds T2_obs
+    upper_search <- Shat + se_S * c(3, 6, 12, 25, 50, 100) * qnorm(1 - alpha / 2)
+    bracket_up   <- NA_real_
+    for (up in upper_search) {
+      q_up <- tryCatch(cf_quant(up, alpha / 2), error = function(e) NA_real_)
+      if (!is.na(q_up) && is.finite(q_up) && q_up >= T2_obs) {
+        bracket_up <- up; break
+      }
+    }
+    if (is.na(bracket_up)) {
+      UCI <- UCI_null
+    } else {
+      UCI <- tryCatch(
+        uniroot(function(s) cf_quant(s, alpha / 2) - T2_obs,
+                lower = Stilde, upper = bracket_up,
+                tol = se_S * 1e-3)$root,
+        error = function(e) UCI_null
+      )
+    }
+  }
+
+  c(LCI = max(LCI, 0), UCI = UCI)
+}
+
+
+# ============================================================
+#  Contrast-matrix helpers
+# ============================================================
+
+#' @noRd
+.get_L_coef <- function(model, coef_name) {
+  coefs <- names(coef(model))
+  coefs <- coefs[!is.na(coef(model))]
+  idx   <- which(coefs == coef_name)
+  if (length(idx) == 0) stop("Coefficient not found: ", coef_name)
+  L <- matrix(0, 1, length(coefs))
+  L[1, idx] <- 1
+  L
+}
+
+#' Type-2 Anova contrast matrix for a single term (in beta space)
+#' Adapted from get_L_anova2 in functions.R
+#' @noRd
+.get_L_anova_term <- function(model, term, vcovmat) {
+  coefs       <- names(coef(model))
+  not_aliased <- !is.na(coef(model))
+  names_terms <- labels(terms(model))
+  which_term  <- which(term == names_terms)
+  factors     <- attr(terms(model), "factors")
+  asgn        <- attr(model.matrix(model), "assign")
+  asgn[!not_aliased] <- NA
+
+  subs_term <- which(asgn == which_term)
+
+  # relatives: terms that contain 'term' as a lower-order effect
+  relatives <- setdiff(seq_along(names_terms), which_term)
+  relatives <- relatives[sapply(names_terms[relatives], function(t2)
+    all(factors[, term] <= factors[, t2]))]
+  subs_rel  <- unlist(lapply(relatives, function(r) which(asgn == r)))
+
+  Ip <- diag(sum(not_aliased))
+  hyp1 <- Ip[subs_rel, , drop = FALSE]
+  hyp2 <- Ip[c(subs_rel, subs_term), , drop = FALSE]
+
+  if (nrow(hyp1) == 0) {
+    L_out <- hyp2
+  } else {
+    # Orthogonalize: columns of hyp2 orthogonal to span(hyp1) under vcovmat metric
+    L_out <- t(.resi_conjcomp(t(hyp1), t(hyp2), vcovmat))
+  }
+  L_out <- L_out[!apply(L_out, 1, function(x) all(x == 0)), , drop = FALSE]
+  L_out
+}
+
+#' @noRd
+.resi_conjcomp <- function(X, Z, ip = diag(nrow(X))) {
+  xq <- qr(t(Z) %*% ip %*% X)
+  if (xq$rank == 0) return(Z)
+  Z %*% qr.Q(xq, complete = TRUE)[, -(seq_len(xq$rank)), drop = FALSE]
+}
+
+
+# ============================================================
+#  Main exported function
+# ============================================================
+
+#' Robust Effect Size Index with Asymptotic Confidence Intervals
+#'
+#' Computes RESI point estimates and asymptotic confidence intervals using
+#' either a normal approximation (Zhang et al., 2025) or a quadratic-form
+#' (Imhof/Davies) approach.
+#'
+#' @param model.full Fitted \code{lm} or \code{glm} model object.
+#' @param data Data frame of model data.
+#' @param vcovfunc Variance estimator for RESI point estimates. Default:
+#'   \code{sandwich::vcovHC}.
+#' @param coefficients Logical; include coefficient table. Default \code{TRUE}.
+#' @param anova Logical; include anova table. Default \code{TRUE}.
+#' @param alpha Numeric; significance level. Default \code{0.05}.
+#' @param ci.method Character; \code{"qf"} (quadratic-form Imhof, default),
+#'   \code{"normal"} (truncated normal),
+#'   or \code{"cf"} (Cornish-Fisher test inversion).
+#' @param type Character; HC type for the sandwich variance used in CI
+#'   construction (controls tau_i weights in SigmaXw). Default \code{"HC3"}.
+#'   Supported: \code{"HC0"}–\code{"HC5"}, \code{"const"}.
+#' @param unbiased Logical; use bias-corrected RESI point estimate. Default
+#'   \code{TRUE}.
+#' @param Anova.args List; additional arguments passed to \code{car::Anova}.
+#' @param vcov.args List; additional arguments passed to \code{vcovfunc}.
+#' @param ... Ignored.
+#' @return A list of class \code{"resi"} with \code{coefficients} and/or
+#'   \code{anova} tables containing RESI point estimates and CIs.
+#' @importFrom sandwich vcovHC estfun
+#' @importFrom CompQuadForm imhof
+#' @importFrom car Anova
+#' @importFrom lmtest coeftest
+#' @importFrom stats coef hatvalues residuals fitted weights qnorm qchisq pchisq pnorm
+#'   model.matrix terms uniroot
+#' @export
+resi_pe_asymptotic <- function(model.full,
+                                data,
+                                vcovfunc  = sandwich::vcovHC,
+                                coefficients = TRUE,
+                                anova        = TRUE,
+                                alpha        = 0.05,
+                                ci.method    = c("qf", "normal", "cf"),
+                                type         = "HC3",
+                                unbiased     = TRUE,
+                                Anova.args   = list(),
+                                vcov.args    = list(),
+                                ...) {
+
+  ci.method    <- match.arg(ci.method)
+  model     <- model.full
+  n         <- nrow(model.matrix(model))
+
+  if (missing(data)) {
+    data <- if (!is.null(model$model)) model$model else
+      stop("data argument required")
+  }
+
+  # ---- vcovfunc with extra args ----
+  if (length(vcov.args) > 0) {
+    vcovfunc2 <- function(x) {
+      args <- c(list(x), vcov.args)
+      do.call(vcovfunc, args)
+    }
+  } else {
+    vcovfunc2 <- vcovfunc
+  }
+
+  # ---- model-level precomputation (extended framework) ----
+  # Treats SigmaX = X'X/n and SigmaXw = X'diag(tau*e^2)X/n as separate
+  # estimators; phi cancels in A^{-1}BA^{-1}, giving a pure influence-function
+  # variance estimate with no chain-rule approximation errors.
+  precomp     <- .resi_precompute_ext(model, type = type)
+  contrast_fn <- .resi_contrast_ext
+
+  # ---- vcov matrix for point estimates (same as resi_pe) ----
+  vcovmat <- tryCatch(vcovfunc2(model), error = function(e)
+    stop("vcovfunc failed: ", conditionMessage(e)))
+
+  output <- list()
+
+  # ============================================================
+  #  Coefficients table  (signed normal CI always)
+  # ============================================================
+  if (coefficients) {
+    coef_names <- names(coef(model))[!is.na(coef(model))]
+    is_lm      <- inherits(model, "lm") && !inherits(model, "glm")
+    rdf        <- if (is_lm) model$df.residual else NULL
+
+    # point estimates via coeftest
+    ctab <- tryCatch(
+      lmtest::coeftest(model, vcov. = vcovmat),
+      error = function(e) stop("coeftest failed")
+    )
+    torZ <- if ("z value" %in% colnames(ctab)) "z" else "t"
+
+    coef_df <- data.frame(
+      Estimate    = ctab[, "Estimate"],
+      `Std. Error` = ctab[, "Std. Error"],
+      Statistic   = ctab[, paste(torZ, "value")],
+      `p-value`   = ctab[, paste0("Pr(>|", torZ, "|)")],
+      check.names = FALSE,
+      row.names   = rownames(ctab)
+    )
+    colnames(coef_df)[3:4] <- c(paste(torZ, "value"),
+                                  paste0("Pr(>|", torZ, "|)"))
+    if (torZ == "z") {
+      coef_df$RESI <- suppressWarnings(z2S(coef_df[[3]], n, unbiased))
+    } else {
+      coef_df$RESI <- suppressWarnings(t2S(coef_df[[3]], rdf, n, unbiased))
+    }
+
+    # asymptotic signed CIs
+    ci_mat <- do.call(rbind, lapply(coef_names, function(cn) {
+      L_mod  <- .get_L_coef(model, cn)
+      contr  <- tryCatch(contrast_fn(precomp, L_mod, vcovmat_n = n * vcovmat),
+                         error = function(e) NULL)
+      if (is.null(contr)) return(c(LCI = NA_real_, UCI = NA_real_))
+      if (ci.method == "cf") {
+        .resi_ci_cf_signed(contr, alpha = alpha)
+      } else {
+        .resi_ci_normal_signed(contr, alpha = alpha)
+      }
+    }))
+
+    coef_df[, paste0(c(alpha / 2, 1 - alpha / 2) * 100, "%")] <- ci_mat
+    output$coefficients <- coef_df
+  }
+
+  # ============================================================
+  #  Anova table  (unsigned CI; method depends on ci.method)
+  # ============================================================
+  if (anova) {
+    is_lm <- inherits(model, "lm") && !inherits(model, "glm")
+
+    # point estimates via car::Anova (matches resi_pe behaviour)
+    if (is_lm) {
+      anova_tab <- tryCatch(
+        suppressMessages(do.call(car::Anova,
+          c(list(mod = model, vcov. = vcovmat), Anova.args))),
+        error = function(e) stop("car::Anova failed")
+      )
+      anova_tab <- anova_tab[rownames(anova_tab) != "Residuals", , drop = FALSE]
+      rdf        <- model$df.residual
+      anova_tab$RESI <- f2S(anova_tab[, "F"], anova_tab[, "Df"], rdf, n)
+    } else {
+      anova_tab <- tryCatch(
+        suppressMessages(do.call(car::Anova,
+          c(list(mod = model, test.statistic = "Wald",
+                 vcov. = vcovmat), Anova.args))),
+        error = function(e) stop("car::Anova failed")
+      )
+      anova_tab <- anova_tab[rownames(anova_tab) != "Residuals", , drop = FALSE]
+      anova_tab$RESI <- chisq2S(anova_tab[, "Chisq"], anova_tab[, "Df"], n)
+    }
+
+    term_names <- rownames(anova_tab)
+
+    # CI for each anova term
+    ci_mat <- do.call(rbind, lapply(term_names, function(term) {
+      L_mod <- tryCatch(
+        .get_L_anova_term(model, term, vcovmat),
+        error = function(e) NULL
+      )
+      if (is.null(L_mod) || nrow(L_mod) == 0)
+        return(c(LCI = NA_real_, UCI = NA_real_))
+
+      contr <- tryCatch(contrast_fn(precomp, L_mod, vcovmat_n = n * vcovmat),
+                        error = function(e) NULL)
+      if (is.null(contr)) return(c(LCI = NA_real_, UCI = NA_real_))
+
+      if (ci.method == "qf") {
+        tryCatch(.resi_ci_qf(contr, alpha = alpha),
+                 error = function(e) c(LCI = NA_real_, UCI = NA_real_))
+      } else if (ci.method == "cf") {
+        tryCatch(.resi_ci_cf(contr, alpha = alpha),
+                 error = function(e) c(LCI = NA_real_, UCI = NA_real_))
+      } else {
+        .resi_ci_normal_unsigned(contr, alpha = alpha)
+      }
+    }))
+
+    anova_tab[, paste0(c(alpha / 2, 1 - alpha / 2) * 100, "%")] <- ci_mat
+    class(anova_tab) <- c("anova_resi", class(anova_tab))
+    output$anova <- anova_tab
+  }
+
+  output$alpha     <- alpha
+  output$ci.method <- ci.method
+  output$type      <- type
+  class(output)    <- c("resi", "list")
+  output
+}
+
+
+# ============================================================
+#  Extended framework: Sigma_X and Sigma_Xw as separate estimators
+# ============================================================
+
+#' Extended precompute: adds SigmaXA, SigmaXB ingredients
+#'
+#' Generalizes to lm and glm (both parametric and robust).
+#' The sandwich V_beta = SigmaXA^{-1} SigmaXB SigmaXA^{-1} is decomposed into
+#' two moment-matrix estimators treated as independent:
+#'   SigmaXA = -(1/n) sum_i c_i c_i' (bread moments; lm: X_i, glm: sqrt(w_i)*X_i)
+#'   SigmaXB = (1/n) sum_i tau_i r_i^2 X_i X_i'  (HC-weighted meat)
+#' where r_i are the appropriate residuals and tau_i the HC squared weights.
+#' @noRd
+.resi_precompute_ext <- function(model, type = "HC3") {
+  is_glm <- inherits(model, "glm")
+  is_lm  <- inherits(model, "lm") && !is_glm
+  if (!is_lm && !is_glm)
+    stop(".resi_precompute_ext: only lm or glm models supported")
+
+  # For CI computation the extended framework always uses a consistent (robust)
+  # variance estimator.  The 'const' type signals the parametric RESI point
+  # estimate but must not carry over to the CI variance: upgrade to HC0 so that
+  # tau_i = 1 (HC0) is used explicitly and 'is_const' does not affect B_full.
+  ci_type <- if (type == "const") "HC0" else type
+
+  precomp <- .resi_precompute(model, type = ci_type, deriv_method = "zeroB")
+  X       <- precomp$X
+  n       <- precomp$n
+  sqrtw   <- precomp$sqrtw
+  tau     <- sqrtw^2          # HC squared weights: tau_i = sqrtw_i^2
+
+  if (is_lm) {
+    # lm: SigmaXA = X'X/n,  SigmaXB = X'diag(tau*e^2)X/n
+    # c_i = X_i (bread contribution),  r_i = e_i (residuals)
+    r   <- residuals(model, "response")   # OLS residuals
+    w_A <- rep(1, n)                       # bread weights: 1 for lm
+    SigmaXA <- crossprod(X) / n
+    SigmaXB <- crossprod(X, tau * r^2 * X) / n
+  } else {
+    # glm: SigmaXA = X'WX/n,  SigmaXB = X'diag(tau*(y-mu)^2)X/n
+    # c_i = sqrt(w_i)*X_i (bread contribution),  r_i = y_i - mu_i
+    w_A <- weights(model, type = "working")  # working weights w_i = mu_i(1-mu_i)
+    r   <- residuals(model, type = "response")  # y - mu(beta_hat)
+    SigmaXA <- crossprod(X * sqrt(w_A), X * sqrt(w_A)) / n   # X'WX/n
+    SigmaXB <- crossprod(X, tau * r^2 * X) / n
+  }
+
+  precomp$SigmaXA     <- SigmaXA
+  precomp$SigmaXA_inv <- .resi_safe_inv(SigmaXA)
+  precomp$SigmaXB     <- SigmaXB
+  precomp$r           <- r          # residuals for direct term
+  precomp$w_A         <- w_A        # bread weights (1 for lm, w_i for glm)
+  precomp$tau         <- tau
+  precomp$deriv_method <- "extended"
+  precomp
+}
+
+#' Extended contrast: Sigma_R via per-observation influence functions
+#'
+#' General formulation for lm and glm (parametric and robust).
+#' The sandwich decomposes as V_beta = SigmaXA^{-1} SigmaXB SigmaXA^{-1} where:
+#'   SigmaXA = bread moment matrix (lm: X'X/n; glm: X'WX/n)
+#'   SigmaXB = HC-weighted meat    (lm: X'diag(tau*e^2)X/n; glm: X'diag(tau*r^2)X/n)
+#'
+#' Per-observation influence function (m1-vector):
+#'   phi_i = phi_direct_i + z_XB_i + z_XA_i
+#' where (H = L SigmaXA^{-1}, d = eigenvalues of Sigma_beta_L = H SigmaXB H'):
+#'   phi_direct_i: sqrt(tau_i)*r_i * Sigma_beta_L^{-1/2} H X_i    [direct beta]
+#'   z_XB_i: -V*(W*(tau_i*r_i^2*atilde_i*atilde_i' - D))*VT_beta  [SigmaXB variance]
+#'   z_XA_i:  V*(W*(atilde_i*delta_i' + delta_i*atilde_i' - 2D))*VT_beta [SigmaXA variance]
+#' where atilde_i = V'H(sqrt(w_A_i)*X_i) and delta_i = V'G(sqrt(w_A_i)*X_i),
+#' G = F*SigmaXB*SigmaXA^{-1}.  For lm: w_A_i = 1; for glm: w_A_i = w_i.
+#'
+#' Centering: E[tau_i r_i^2 atilde_i atilde_i^T]_eig = D  => const_XB = VT_beta/(2*sqrtd)
+#'            E[atilde_i delta_i^T + delta_i atilde_i^T]_eig = 2D => const_XA = 2*const_XB
+#' @noRd
+.resi_contrast_ext <- function(precomp_ext, L_model, vcovmat_n = NULL) {
+  stopifnot(identical(precomp_ext$deriv_method, "extended"))
+
+  m1          <- nrow(L_model)
+  n           <- precomp_ext$n
+  X           <- precomp_ext$X
+  r           <- precomp_ext$r           # residuals (e for lm, y-mu for glm)
+  tau         <- precomp_ext$tau
+  w_A         <- precomp_ext$w_A         # bread weights (1 for lm, w_i for glm)
+  SigmaXA_inv <- precomp_ext$SigmaXA_inv
+  SigmaXB     <- precomp_ext$SigmaXB
+
+  # H = L_model SigmaXA^{-1}  (m1 x p)
+  H <- L_model %*% SigmaXA_inv
+
+  # Sigma_beta_L = H SigmaXB H'  (m1 x m1)
+  # General sandwich: V_beta = SigmaXA^{-1} SigmaXB SigmaXA^{-1}
+  # For lm: phi cancels in A^{-1}BA^{-1} giving SigmaXA=X'X/n, SigmaXB=SigmaXw.
+  # For glm: A_beta = X'WX/n (SigmaXA), B_beta = HC-weighted meat (SigmaXB).
+  Sigma_beta_L <- .resi_sym(H %*% SigmaXB %*% t(H))
+
+  # EVD
+  eig   <- eigen(Sigma_beta_L, symmetric = TRUE)
+  d     <- pmax(eig$values, .Machine$double.eps)
+  V_eig <- eig$vectors           # m1 x m1
+  sqrtd <- sqrt(d)
+  Phat  <- V_eig %*% diag(1/sqrtd, m1) %*% t(V_eig)   # Sigma_beta_L^{-1/2}
+  W     <- outer(sqrtd, sqrtd, function(a, b) 1/(a*b*(a+b)))
+
+  # Point estimate
+  beta_hat <- as.vector(L_model %*% coef(precomp_ext$model))  # m1-vector
+  R_beta   <- as.vector(Phat %*% beta_hat)   # m1-vector
+  Stilde   <- sqrt(sum(R_beta^2))
+  VT_beta  <- as.vector(t(V_eig) %*% beta_hat)   # m1-vector, eigenspace
+
+  # Projected matrices (m1 x p)
+  # F = V'H,  G = F*SigmaXB*SigmaXA^{-1}
+  F_mat <- t(V_eig) %*% H
+  G_mat <- F_mat %*% SigmaXB %*% SigmaXA_inv
+
+  # Per-obs projections (m1 x n)
+  # FX_tilde: for SigmaXB and direct — uses X_i directly (SigmaXB = X'diag(tau*r^2)X/n)
+  #   E[tau_i r_i^2 FX_tilde_i FX_tilde_i^T]_eig = F SigmaXB F^T = D  => const_XB = VT_beta/(2*sqrtd) ✓
+  # A_tilde: for SigmaXA — uses c_i = sqrt(w_A_i)*X_i (SigmaXA = sum_i w_A_i X_i X_i^T / n)
+  #   E[A_tilde_i A_tilde_i^T]_eig = F SigmaXA F^T = D  => const_XA = 2*VT_beta/(2*sqrtd) ✓
+  FX_tilde <- F_mat %*% t(X)           # m1 x n: F X_i  (unweighted, for B and direct)
+  C_mat    <- sweep(t(X), 2, sqrt(w_A), '*')  # p x n: sqrt(w_A_i)*X_i
+  A_tilde  <- F_mat %*% C_mat           # m1 x n: F * sqrt(w_A_i)*X_i  (for SigmaXA)
+  D_tilde  <- G_mat %*% C_mat           # m1 x n: G * sqrt(w_A_i)*X_i  (for SigmaXA)
+
+  # Lyapunov-weighted projections: Wvb[j,k] = W[j,k]*VT_beta[k]
+  Wvb       <- W * matrix(VT_beta, m1, m1, byrow = TRUE)   # m1 x m1
+  Q_B_mat   <- Wvb %*% FX_tilde   # m1 x n: for z_XB (uses unweighted FX)
+  Q_mat     <- Wvb %*% A_tilde    # m1 x n: for z_XA (uses w_A-weighted atilde)
+  Q_D_mat   <- Wvb %*% D_tilde    # m1 x n: for z_XA delta term
+
+  # Centering constants (m1-vectors, eigenspace):
+  # E[tau_i r_i^2 FX_tilde_i FX_tilde_i^T]_eig = F SigmaXB F^T = D => const_XB = VT_beta/(2*sqrtd)
+  # E[A_tilde_i delta_i^T + delta_i A_tilde_i^T]_eig = 2D           => const_XA = 2*const_XB
+  const_XB <- VT_beta / (2 * sqrtd)   # m1-vector
+  const_XA <- 2 * const_XB
+
+  # Assemble per-obs influence functions (m1 x n)
+  # (1) Direct beta: sqrt(tau_i)*r_i * Sigma_beta_L^{-1/2} * H * X_i  (uses FX_tilde)
+  sc <- sqrt(tau) * r   # n-vector: HC-weighted residuals
+  phi_direct <- (V_eig %*% sweep(FX_tilde, 1, sqrtd, '/')) *
+                matrix(sc, m1, n, byrow = TRUE)
+
+  # (2) SigmaXB: -V*(W*(tau_i*r_i^2*FX_tilde_i FX_tilde_i' - D))*VT_beta  (uses FX_tilde)
+  XB_core  <- sweep(FX_tilde * Q_B_mat, 2, tau * r^2, '*') -
+               matrix(const_XB, m1, n)
+  phi_XB_m <- -V_eig %*% XB_core
+
+  # (3) SigmaXA: V*(W*(A_tilde_i delta_i' + delta_i A_tilde_i' - 2D))*VT_beta  (uses A_tilde)
+  XA_core  <- A_tilde * Q_D_mat + D_tilde * Q_mat - matrix(const_XA, m1, n)
+  phi_XA_m <- V_eig %*% XA_core
+
+  phi_ext <- phi_direct + phi_XB_m + phi_XA_m   # m1 x n
+
+  # Sigma_R_ext = (1/n) * phi_ext %*% t(phi_ext)  (m1 x m1)
+  Sigma_R_ext <- .resi_sym(tcrossprod(phi_ext) / n)
+
+  list(
+    m1         = m1,
+    n          = n,
+    beta_hat   = beta_hat,
+    Sigma_beta = Sigma_beta_L,
+    R_beta     = R_beta,
+    Stilde     = Stilde,
+    dR_dtheta  = NULL,
+    dR_direct  = NULL,
+    dR_Achain  = NULL,
+    dR_Bchain  = NULL,
+    Sigma_R    = Sigma_R_ext,
+    phi_tilde  = if (m1 == 1L) drop(phi_ext) else NULL
+  )
+}
+
+
+# ============================================================
+#  Utility helpers (all unexported)
+# ============================================================
+
+#' @noRd
+.resi_mean_list <- function(lst) {
+  Reduce("+", lst) / length(lst)
+}
+
+#' @noRd
+.resi_mean_outer <- function(psi_list, sqrtw, lm_phi_row = FALSE) {
+  n <- length(psi_list)
+  m <- ncol(psi_list[[1]])
+  B <- matrix(0, m, m)
+  for (i in seq_len(n)) {
+    psi_i <- psi_list[[i]]   # 1 x m
+    if (lm_phi_row) {
+      # phi row unweighted, beta rows weighted
+      psi_w          <- psi_i
+      psi_w[1, 2:m]  <- psi_i[1, 2:m] * sqrtw[i]
+    } else {
+      psi_w <- psi_i * sqrtw[i]
+    }
+    B <- B + crossprod(psi_w)
+  }
+  B / n
+}
+
+#' @noRd
+.resi_sym <- function(M) (M + t(M)) / 2
+
+#' @noRd
+.resi_safe_inv <- function(M) {
+  tryCatch(chol2inv(chol(M)), error = function(e) solve(M))
+}
+
+#' Truncated CI for unsigned RESI (Algorithm 1, Zhang et al. 2025)
+#' @noRd
+.resi_truncate_ci <- function(Shat, se, n, m1, alpha = 0.05) {
+  z1 <- qnorm(1 - alpha / 2)
+  SL <- Shat - z1 * se
+  SU <- Shat + z1 * se
+
+  if (SL > 0) return(c(SL, SU))
+
+  # probability mass at/below zero under H0: P(T^2 > n*Shat^2 | S=0)
+  # Under H0, T^2 ~ chi^2_{m1}, so P(T^2 > m1 + n*Shat^2) (since Shat^2 = (T^2-m1)/n)
+  gamma_p <- pchisq(m1 + n * Shat^2, df = m1, lower.tail = FALSE)
+
+  if (gamma_p < alpha / 2) {
+    SU <- Shat + qnorm(1 - (alpha - gamma_p)) * se
+  } else {
+    SU <- Shat + qnorm(1 - alpha) * se
+  }
+  c(0, SU)
+}

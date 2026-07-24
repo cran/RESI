@@ -128,8 +128,8 @@ if(requireNamespace("tibble")){
     mod.zinf.tib <- pscl::zeroinfl(art ~ fem + mar + kid5 + phd + ment | fem + mar +
                                      kid5 + phd + ment, data = tib.hurdle)
   }
+  tib.gee <- tibble::as_tibble(data.gee)
   if(requireNamespace("gee")){
-    tib.gee <- tibble::as_tibble(data.gee)
     mod.gee.tib <- gee::gee(depression ~ diagnose + drug*time, data = tib.gee,
                             id = id, family = binomial, corstr = "independence")
   }
@@ -156,6 +156,13 @@ if(requireNamespace("glmmTMB")){
   model_glmmTMB <- glmmTMB::glmmTMB(Reaction ~ Days + (1 | Subject), data = lme4::sleepstudy, family = gaussian())
 }
 
+# Models with transformed responses -- used to test that bootstrap (resi_stat)
+# can update() the reduced model on bootstrap data that has the raw columns
+# (e.g. 'charges') but NOT the pre-computed transformed column ('log10(charges)').
+mod.lm.log10  <- lm(log10(charges) ~ region + age + bmi + sex, data = data)
+mod.glm.I     <- glm(I(charges > 15000) ~ region + age + bmi + sex,
+                     data = data, family = binomial())
+
 ## tests
 test_that("Specifying non-allowed vcov produces warning",{
   expect_warning(resi(mod.nls, data = data.nls, nboot = 1, vcovfunc = sandwich::vcovHC),
@@ -181,8 +188,12 @@ test_that("boot.method = 'bayes' only works for lm and nls", {
 })
 
 test_that("data is needed for certain models", {
-  expect_error(resi(mod.s, nboot = 1))
-  expect_error(resi(mod.lm.s, nboot = 1))
+  # mod.s now uses ci.method='qf' by default, which succeeds without data;
+  # use ci.method='boot' to test that bootstrapping fails without data
+  expect_error(resi(mod.s, nboot = 1, ci.method = "boot"))
+  # mod.lm.s now uses ci.method='qf' by default, which succeeds without data;
+  # use ci.method='boot' to test that bootstrapping fails without data
+  expect_error(resi(mod.lm.s, nboot = 1, ci.method = "boot"))
   expect_error(resi(mod.nls, nboot = 1))
   if(requireNamespace("survival")){
   expect_error(resi(mod.surv, nboot = 1))
@@ -268,7 +279,7 @@ test_that("resi produces the correct estimates", {
   expect_equal(unname(suppressWarnings(resi(mod.lme, nboot = 10)$coefficients[,'RESI'])),
                c(3.659090, 1.739166, 0.512371), tolerance = 1e-07)
   if(requireNamespace("lme4")){
-  expect_equal(unname(suppressWarnings(resi(mod.lmerMod, nboot = 10)$coefficients[,'RESI'])),
+  expect_equal(unname(suppressWarnings(resi(mod.lmerMod, nboot = 10)$coefficients[,'L-RESI'])),
                c(8.434942, 1.533073), tolerance = 1e-07)}
   if(requireNamespace("glmmTMB")){
     expect_equal(unname(suppressWarnings(resi(model_glmmTMB, nboot = 10)$coefficients[,'RESI'])),
@@ -282,7 +293,9 @@ test_that("RESI estimates are in between the confidence limits", {
   expect_true(all(resi.obj$anova$RESI >= resi.obj$anova$`2.5%`) & all(resi.obj$anova$RESI <= resi.obj$anova$`97.5%`))
   An.obj = car::Anova(resi.obj, alpha = 0.01)
   expect_true(all(An.obj$RESI >= An.obj$`0.05%`) & all(An.obj$RESI <= An.obj$`99.5%`))
-  resi.obj = resi(mod.lm, nboot = 500, store.boot = TRUE)
+  # ci.method='boot' needed: resi.lm now defaults to 'qf' which skips bootstrap
+  # and store.boot=TRUE would have no effect, breaking Anova.resi at a new alpha
+  resi.obj = resi(mod.lm, nboot = 500, store.boot = TRUE, ci.method = "boot")
   expect_true(all(resi.obj$coefficients$RESI >= resi.obj$coefficients$`2.5%`) & all(resi.obj$coefficients$RESI <= resi.obj$coefficients$`97.5%`))
   expect_true(all(resi.obj$anova[1:5, "RESI"] >= resi.obj$anova[1:5, "2.5%"]) & all(resi.obj$anova[1:5, "RESI"] <= resi.obj$anova[1:5, "RESI"]))
   An.obj = car::Anova(resi.obj, alpha = 0.01)
@@ -303,6 +316,60 @@ test_that("RESI estimates are in between the confidence limits", {
   expect_true(all(resi.obj$anova$`L-RESI` >= resi.obj$anova$`L 2.5%`) & all(resi.obj$anova$RESI <= resi.obj$anova$`L 97.5%`))
   expect_true(all(resi.obj$anova$`CS-RESI` >= resi.obj$anova$`CS 2.5%`) & all(resi.obj$anova$RESI <= resi.obj$anova$`CS 97.5%`))}
 })
+
+# Regression test: bootstrap must succeed for models with transformed responses.
+# Bug: resi.default previously fit the intercept-only reduced model using a
+# backtick-quoted column name (e.g. `log10(charges)` ~ 1) from model.frame,
+# which broke resi_stat's update(model.reduced, data = boot.data) because
+# boot.data has 'charges' but not a pre-computed 'log10(charges)' column.
+# Every replicate returned NA -> "Bootstrapping failed" error.
+test_that("bootstrap succeeds for models with transformed responses", {
+  set.seed(1)
+  # lm with log-transformed response
+  r.lm <- resi(mod.lm.log10, data = data, nboot = 20, ci.method = "boot")
+  expect_s3_class(r.lm, "resi")
+  expect_false(anyNA(r.lm$coefficients$RESI))
+  expect_true(all(r.lm$coefficients$RESI >= r.lm$coefficients$`2.5%`))
+  expect_true(all(r.lm$coefficients$RESI <= r.lm$coefficients$`97.5%`))
+
+  # glm with I() binary response
+  r.glm <- suppressWarnings(
+    resi(mod.glm.I, data = data, nboot = 20, ci.method = "boot")
+  )
+  expect_s3_class(r.glm, "resi")
+  expect_false(anyNA(r.glm$coefficients$RESI))
+  expect_true(all(r.glm$coefficients$RESI >= r.glm$coefficients$`2.5%`))
+  expect_true(all(r.glm$coefficients$RESI <= r.glm$coefficients$`97.5%`))
+})
+
+if(requireNamespace("lme4")){
+test_that("lmerMod: L-RESI and CS-RESI point estimates are correct", {
+  pe = suppressWarnings(resi_pe(mod.lmerMod))
+  expect_equal(unname(pe$coefficients[,'L-RESI']),
+               c(8.434942, 1.533073), tolerance = 1e-07)
+  expect_equal(unname(pe$coefficients[,'CS-RESI']),
+               c(3.6680844, 0.6185898), tolerance = 1e-06)
+  expect_equal(unname(pe$anova[,'L-RESI']),  1.533073, tolerance = 1e-06)
+  expect_equal(unname(pe$anova[,'CS-RESI']), 0.5719247, tolerance = 1e-06)
+})
+
+if(requireNamespace("geepack")){
+test_that("geeglm (exchangeable, positive rho) L-RESI matches lmerMod (CR0) L-RESI", {
+  sdata = lme4::sleepstudy
+  sdata$subjid = as.integer(sdata$Subject)
+  mod_lmer_ri  = lme4::lmer(Reaction ~ Days + (1 | Subject), sdata)
+  mod_gee_exch = geepack::geeglm(Reaction ~ Days, data = sdata, id = subjid,
+                                  family = gaussian, corstr = "exchangeable")
+  pe_lmer = suppressWarnings(resi_pe(mod_lmer_ri, vcov.args = list(type = "CR0")))
+  pe_gee  = resi_pe(mod_gee_exch)
+  # for positive exchangeable correlation (alpha ~ 0.58), GEE and CR0 sandwich
+  # give the same L-RESI up to finite-sample differences
+  expect_equal(unname(pe_lmer$coefficients[,'L-RESI']),
+               unname(pe_gee$coefficients[,'L-RESI']), tolerance = 0.05)
+  # CS-RESI is identical: both compute the same weighted independence lm + HC0
+  expect_equal(unname(pe_lmer$coefficients[,'CS-RESI']),
+               unname(pe_gee$coefficients[,'CS-RESI']), tolerance = 1e-07)
+})}}
 
 if(requireNamespace("gee") & requireNamespace("geepack")){
 test_that("vcov methods same for gee and geeglm",{
@@ -420,7 +487,7 @@ test_that("tibbles work", {
   #   expect_equal(unname(resi(mod.glmgee.tib, nboot = 10)$coefficients[,'L-RESI']), c(-0.02585617, -0.48811210, 0.01414410, 0.56177861, -0.29398258), tolerance = 1e-07)
   # }
   if(requireNamespace("lme4")){
-  expect_equal(unname(suppressWarnings(resi(mod.lmerMod.tib, nboot = 10))$coefficients[,'RESI']),c(8.434942, 1.533073), tolerance = 1e-07)
+  expect_equal(unname(suppressWarnings(resi(mod.lmerMod.tib, nboot = 10))$coefficients[,'L-RESI']),c(8.434942, 1.533073), tolerance = 1e-07)
   }
 })}
 
@@ -457,5 +524,98 @@ test_that("overall = FALSE doesn't produce an error", {
   expect_equal(unname(resi(mod.lm, nboot = 1, overall = F, coefficients = F)$estimates),
                c(0.03647985, 0.29511133, 0.14979819, 0.05154917, 0.01605603), tolerance = 1e-05)
 })
+
+# robustbase: lmrob and glmrob
+if (requireNamespace("robustbase", quietly = TRUE)) {
+  set.seed(7)
+  n_rob <- 150
+  df_rob <- data.frame(
+    x1 = rnorm(n_rob),
+    x2 = factor(sample(c("a", "b", "c"), n_rob, replace = TRUE)),
+    y  = rnorm(n_rob)
+  )
+  df_rob$y <- df_rob$y + 2 * df_rob$x1 +
+    ifelse(df_rob$x2 == "b", 1.5, ifelse(df_rob$x2 == "c", -1, 0))
+  df_rob$y[1:5] <- df_rob$y[1:5] + 15   # outliers
+
+  mod.lmrob     <- robustbase::lmrob(y ~ x1 + x2, data = df_rob)
+  mod.lmrob.r   <- robustbase::lmrob(y ~ x1,      data = df_rob)
+  mod.lmrob.int <- robustbase::lmrob(y ~ 1,        data = df_rob)
+
+  set.seed(7)
+  n_grob <- 150
+  df_glmrob <- data.frame(
+    x1 = rnorm(n_grob),
+    x2 = factor(sample(c("a", "b", "c"), n_grob, replace = TRUE))
+  )
+  lp_grob <- 1.5 * df_glmrob$x1 +
+    ifelse(df_glmrob$x2 == "b", 1, -0.5)
+  df_glmrob$y <- rbinom(n_grob, 1, plogis(lp_grob))
+
+  mod.glmrob     <- suppressWarnings(robustbase::glmrob(y ~ x1 + x2, family = binomial, data = df_glmrob))
+  mod.glmrob.r   <- suppressWarnings(robustbase::glmrob(y ~ x1,      family = binomial, data = df_glmrob))
+  mod.glmrob.int <- suppressWarnings(robustbase::glmrob(y ~ 1,        family = binomial, data = df_glmrob))
+
+  test_that("lmrob: resi_pe produces correct estimates", {
+    pe <- suppressWarnings(resi_pe(mod.lmrob))
+    expect_equal(unname(pe$estimates),
+                 c(2.1317677, 0.0321117, 1.7228418, 0.5869813, -0.2935287,
+                   1.7298297, 0.9128559),
+                 tolerance = 1e-06)
+    expect_equal(unname(pe$anova$RESI),  c(1.7298297, 0.9128559), tolerance = 1e-06)
+    expect_equal(unname(pe$coefficients$RESI),
+                 c(0.0321117, 1.7228418, 0.5869813, -0.2935287), tolerance = 1e-06)
+  })
+
+  test_that("lmrob: resi() returns RESI within CI bounds", {
+    set.seed(1)
+    ro <- suppressWarnings(resi(mod.lmrob, nboot = 100))
+    expect_true(all(ro$coefficients$RESI >= ro$coefficients$`2.5%`))
+    expect_true(all(ro$coefficients$RESI <= ro$coefficients$`97.5%`))
+    expect_true(all(ro$anova$RESI >= ro$anova$`2.5%`))
+    expect_true(all(ro$anova$RESI <= ro$anova$`97.5%`))
+  })
+
+  test_that("lmrob: specifying a reduced model only changes overall output", {
+    ro  <- suppressWarnings(resi(mod.lmrob,   nboot = 1))
+    ror <- suppressWarnings(resi(mod.lmrob, model.reduced = mod.lmrob.r, nboot = 1))
+    expect_equal(ro$coefficients$RESI, ror$coefficients$RESI)
+    expect_equal(ro$anova$RESI,        ror$anova$RESI)
+    expect_false(ro$overall$RESI[2]   == ror$overall$RESI[2])
+  })
+
+  test_that("lmrob: intercept-only model has no overall element", {
+    expect_true(is.null(suppressWarnings(resi(mod.lmrob.int, nboot = 1, anova = FALSE))$overall))
+  })
+
+  test_that("glmrob: resi_pe produces correct estimates", {
+    pe2 <- suppressWarnings(resi_pe(mod.glmrob))
+    expect_equal(unname(pe2$estimates),
+                 c(0.4340252, -0.1257804, 0.4254354, 0.2549712, 0.0386988,
+                   0.4175268, 0.2551174),
+                 tolerance = 1e-06)
+    expect_equal(unname(pe2$anova$RESI), c(0.4175268, 0.2551174), tolerance = 1e-06)
+  })
+
+  test_that("glmrob: resi() returns RESI within CI bounds", {
+    set.seed(1)
+    ro2 <- suppressWarnings(resi(mod.glmrob, data = df_glmrob, nboot = 100))
+    expect_true(all(ro2$coefficients$RESI >= ro2$coefficients$`2.5%`))
+    expect_true(all(ro2$coefficients$RESI <= ro2$coefficients$`97.5%`))
+    expect_true(all(ro2$anova$RESI >= ro2$anova$`2.5%`))
+    expect_true(all(ro2$anova$RESI <= ro2$anova$`97.5%`))
+  })
+
+  test_that("glmrob: vcovHC redirects to stats::vcov with warning", {
+    expect_warning(
+      resi_pe(mod.glmrob, vcovfunc = sandwich::vcovHC),
+      "sandwich::vcovHC is not supported for glmrob"
+    )
+  })
+
+  test_that("glmrob: intercept-only model has no overall element", {
+    expect_true(is.null(suppressWarnings(resi(mod.glmrob.int, data = df_glmrob, nboot = 1, anova = FALSE))$overall))
+  })
+}
 
 
